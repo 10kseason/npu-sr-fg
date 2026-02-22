@@ -1,10 +1,11 @@
-import csv
+﻿import csv
 import ctypes
-from collections import deque
+import os
 import queue
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageGrab, ImageTk
 
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = THIS_DIR.parent
@@ -29,15 +29,27 @@ from lunasr_universal import (
     mode_defaults,
     resolve_luna_profile,
 )
+from realtime_backend import build_backend_bundle
+from realtime_capture import (
+    DEFAULT_CAPTURE_BACKEND as CAPTURE_DEFAULT_BACKEND,
+    SUPPORTED_CAPTURE_BACKENDS,
+    LatestCapturePump as CapturePump,
+    WindowInfo as CaptureWindowInfo,
+    capture_window_bgr as capture_window_bgr_mod,
+    dxgi_capture_status as capture_dxgi_status,
+    enumerate_windows as capture_enumerate_windows,
+    get_monitor_rect_for_window as capture_get_monitor_rect_for_window,
+)
+from realtime_ui import OverlayWindow as RealtimeOverlayWindow, build_help_text
 
-DEFAULT_OV_MODEL = "model/ir/fixed_sr_algo_x2_temporal.xml"
-DEFAULT_OV_MODEL_T192 = "model/ir/fixed_sr_algo_x2_temporal_t192.xml"
-DEFAULT_OV_MODEL_T256 = "model/ir/fixed_sr_algo_x2_temporal_t256.xml"
+DEFAULT_OV_MODEL = "model/ir/fixed_sr_algo_x2_temporal_v2_t192_i8_offline.xml"
+DEFAULT_OV_MODEL_T192 = "model/ir/fixed_sr_algo_x2_temporal_v2_t192_i8_offline.xml"
+DEFAULT_OV_MODEL_T256 = "model/ir/fixed_sr_algo_x2_temporal_v2_t256_i8_offline.xml"
 DEFAULT_FG_MODEL = "model/ir/fixed_fg_algo_mid.xml"
 DEFAULT_OV_PRESET = "speed"
 DEFAULT_OV_INTERNAL_SCALE = 0.50
 DEFAULT_OV_CACHE_DIR = ".ov_cache"
-DEFAULT_CAPTURE_BACKEND = "gdi"
+DEFAULT_CAPTURE_BACKEND = CAPTURE_DEFAULT_BACKEND
 DEFAULT_OUTPUT_PRESET = "AUTO"
 DEFAULT_GPU_VIDEO_PATH = True
 DEFAULT_TEMPORAL_RESTORE = True
@@ -51,111 +63,97 @@ DEFAULT_OV_PARALLEL_REQS_NPU_HARD_CAP = 256
 DEFAULT_OV_PARALLEL_REQS_GPU = 0
 DEFAULT_OV_PARALLEL_REQS_GPU_HARD_CAP = 32
 DEFAULT_OV_PARALLEL_REQS_CPU = 2
+DEFAULT_FORCE_INPLACE_OVERLAY = (
+    os.environ.get("LUNASR_FORCE_INPLACE_OVERLAY", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 GPU_TILE_BASE_MAX_W = 1280
 GPU_TILE_BASE_MAX_H = 720
 CAPTURE_FRAME_BUFFER_SIZE = 4
 OVERLAY_POLL_INTERVAL_MS = 8
 STATUS_POLL_INTERVAL_MS = 100
+NATIVE_EVENT_POLL_INTERVAL_MS = 30
 LUNASR_ONLY_MODE = False
+
+WM_HOTKEY = 0x0312
+WM_APP = 0x8000
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+PM_REMOVE = 0x0001
+TRAY_CALLBACK_MSG = WM_APP + 101
+
+NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+
+MOD_NOREPEAT = 0x4000
+VK_F8 = 0x77
+VK_F9 = 0x78
+HOTKEY_ID_TOGGLE = 0x5001
+HOTKEY_ID_SHOWHIDE = 0x5002
+IDI_APPLICATION = 32512
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", wintypes.POINT),
+        ("lPrivate", wintypes.DWORD),
+    ]
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-GWL_EXSTYLE = -20
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_NOACTIVATE = 0x08000000
-LWA_ALPHA = 0x00000002
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOZORDER = 0x0004
-SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
-HWND_TOPMOST = -1
-WDA_NONE = 0x00000000
-WDA_EXCLUDEFROMCAPTURE = 0x00000011
-WINDOW_TITLE_MAX = 512
-MONITOR_DEFAULTTONEAREST = 0x00000002
-SRCCOPY = 0x00CC0020
-CAPTUREBLT = 0x40000000
-DIB_RGB_COLORS = 0
-BI_RGB = 0
-PW_RENDERFULLCONTENT = 0x00000002
-
-user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-user32.MonitorFromWindow.restype = ctypes.c_void_p
-user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-user32.GetMonitorInfoW.restype = ctypes.c_bool
-user32.GetWindowDC.argtypes = [ctypes.c_void_p]
-user32.GetWindowDC.restype = ctypes.c_void_p
-user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-user32.ReleaseDC.restype = ctypes.c_int
-user32.EnableWindow.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-user32.EnableWindow.restype = ctypes.c_bool
-user32.GetForegroundWindow.argtypes = []
-user32.GetForegroundWindow.restype = ctypes.c_void_p
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
 user32.SetForegroundWindow.restype = ctypes.c_bool
-user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
-user32.PrintWindow.restype = ctypes.c_bool
-gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
-gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
-gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
-gdi32.DeleteDC.restype = ctypes.c_bool
-gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
-gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
-gdi32.DeleteObject.restype = ctypes.c_bool
-gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-gdi32.SelectObject.restype = ctypes.c_void_p
-gdi32.BitBlt.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_void_p,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_uint,
-]
-gdi32.BitBlt.restype = ctypes.c_bool
-
-
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize", ctypes.c_uint32),
-        ("biWidth", ctypes.c_long),
-        ("biHeight", ctypes.c_long),
-        ("biPlanes", ctypes.c_ushort),
-        ("biBitCount", ctypes.c_ushort),
-        ("biCompression", ctypes.c_uint32),
-        ("biSizeImage", ctypes.c_uint32),
-        ("biXPelsPerMeter", ctypes.c_long),
-        ("biYPelsPerMeter", ctypes.c_long),
-        ("biClrUsed", ctypes.c_uint32),
-        ("biClrImportant", ctypes.c_uint32),
-    ]
-
-
-class BITMAPINFO(ctypes.Structure):
-    _fields_ = [
-        ("bmiHeader", BITMAPINFOHEADER),
-        ("bmiColors", ctypes.c_uint32 * 3),
-    ]
-
-
-gdi32.GetDIBits.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    ctypes.c_uint,
-    ctypes.c_uint,
-    ctypes.c_void_p,
-    ctypes.POINTER(BITMAPINFO),
-    ctypes.c_uint,
-]
-gdi32.GetDIBits.restype = ctypes.c_int
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+user32.LoadIconW.restype = wintypes.HICON
+shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
 
 def enable_dpi_awareness() -> str:
@@ -295,46 +293,6 @@ def temporal_restore_bgr(
     return out_u8, ms
 
 
-class RECT(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_long),
-        ("top", ctypes.c_long),
-        ("right", ctypes.c_long),
-        ("bottom", ctypes.c_long),
-    ]
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.c_uint),
-        ("rcMonitor", RECT),
-        ("rcWork", RECT),
-        ("dwFlags", ctypes.c_uint),
-    ]
-
-
-@dataclass
-class WindowInfo:
-    hwnd: int
-    title: str
-    left: int
-    top: int
-    right: int
-    bottom: int
-
-    @property
-    def width(self) -> int:
-        return max(0, self.right - self.left)
-
-    @property
-    def height(self) -> int:
-        return max(0, self.bottom - self.top)
-
-    @property
-    def label(self) -> str:
-        return f"[0x{self.hwnd:08X}] {self.title} ({self.width}x{self.height})"
-
-
 @dataclass
 class RuntimeConfig:
     hwnd: int
@@ -369,46 +327,11 @@ class RuntimeConfig:
     fg_precision: str
     fg_size: int
     fg_timestep: float
-
-
-def get_window_text(hwnd: int) -> str:
-    length = user32.GetWindowTextLengthW(hwnd)
-    if length <= 0:
-        return ""
-    buff = ctypes.create_unicode_buffer(min(length + 1, WINDOW_TITLE_MAX))
-    user32.GetWindowTextW(hwnd, buff, WINDOW_TITLE_MAX)
-    text = buff.value
-    for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        text = text.replace(token, "")
-    text = "".join(ch for ch in text if ch.isprintable())
-    return text.strip()
-
-
-def get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
-    rect = RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
-    left, top, right, bottom = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
-    if right <= left or bottom <= top:
-        return None
-    return left, top, right, bottom
+    overlay_force_inplace: bool = False
 
 
 def get_monitor_rect_for_window(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
-    monitor = user32.MonitorFromWindow(int(hwnd), MONITOR_DEFAULTTONEAREST)
-    if not monitor:
-        return None
-    info = MONITORINFO()
-    info.cbSize = ctypes.sizeof(MONITORINFO)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return None
-    left = int(info.rcMonitor.left)
-    top = int(info.rcMonitor.top)
-    right = int(info.rcMonitor.right)
-    bottom = int(info.rcMonitor.bottom)
-    if right <= left or bottom <= top:
-        return None
-    return left, top, right, bottom
+    return capture_get_monitor_rect_for_window(hwnd)
 
 
 TARGET_HEIGHT_PRESETS: Dict[str, int] = {
@@ -520,176 +443,85 @@ def build_centered_overlay_rect(
     return int(nl), int(nt), int(nr), int(nb)
 
 
-def enumerate_windows() -> List[WindowInfo]:
-    result: List[WindowInfo] = []
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    def enum_cb(hwnd, _lparam):
-        hwnd_i = int(hwnd)
-        if not user32.IsWindowVisible(hwnd_i):
-            return True
-        title = get_window_text(hwnd_i)
-        if not title:
-            return True
-        if title.lower().startswith("lunasr realtime gui"):
-            return True
-        ex_style = user32.GetWindowLongW(hwnd_i, GWL_EXSTYLE)
-        if ex_style & WS_EX_TOOLWINDOW:
-            return True
-        rect = get_window_rect(hwnd_i)
-        if rect is None:
-            return True
-        left, top, right, bottom = rect
-        if (right - left) < 160 or (bottom - top) < 120:
-            return True
-        result.append(
-            WindowInfo(
-                hwnd=hwnd_i,
-                title=title,
-                left=left,
-                top=top,
-                right=right,
-                bottom=bottom,
-            )
-        )
-        return True
-
-    user32.EnumWindows(enum_cb, 0)
-    result.sort(key=lambda x: x.title.lower())
-    return result
-
-
-def capture_window_bgr_gdi(hwnd: int) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    rect = get_window_rect(hwnd)
-    if rect is None:
+def build_detached_preview_rect(
+    src_rect: Tuple[int, int, int, int],
+    target_w: int,
+    target_h: int,
+    monitor_rect: Optional[Tuple[int, int, int, int]],
+    gap: int = 16,
+) -> Optional[Tuple[int, int, int, int]]:
+    if monitor_rect is None:
         return None
-    left, top, right, bottom = rect
-    w = max(1, right - left)
-    h = max(1, bottom - top)
 
-    hwnd_dc = ctypes.c_void_p(0)
-    mem_dc = ctypes.c_void_p(0)
-    bmp = ctypes.c_void_p(0)
-    old_obj = ctypes.c_void_p(0)
-    try:
-        hwnd_dc = ctypes.c_void_p(user32.GetWindowDC(int(hwnd)))
-        if not hwnd_dc.value:
-            return None
+    ml, mt, mr, mb = monitor_rect
+    sl, st, sr, sb = src_rect
+    g = max(0, int(gap))
+    min_side = 160
 
-        mem_dc = ctypes.c_void_p(gdi32.CreateCompatibleDC(hwnd_dc))
-        if not mem_dc.value:
-            return None
+    areas: List[Tuple[int, int, int, int]] = [
+        (sr + g, mt + g, mr - g, mb - g),  # right strip
+        (ml + g, mt + g, sl - g, mb - g),  # left strip
+        (ml + g, sb + g, mr - g, mb - g),  # bottom strip
+        (ml + g, mt + g, mr - g, st - g),  # top strip
+    ]
 
-        bmp = ctypes.c_void_p(gdi32.CreateCompatibleBitmap(hwnd_dc, w, h))
-        if not bmp.value:
-            return None
-
-        old_obj = ctypes.c_void_p(gdi32.SelectObject(mem_dc, bmp))
-        if not old_obj.value:
-            return None
-
-        # Capture target hwnd directly to avoid recursive overlay feedback.
-        ok = bool(user32.PrintWindow(int(hwnd), mem_dc, PW_RENDERFULLCONTENT))
-        if not ok:
-            ok = bool(user32.PrintWindow(int(hwnd), mem_dc, 0))
-        if not ok:
-            return None
-
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = w
-        bmi.bmiHeader.biHeight = -h  # top-down
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = BI_RGB
-        buf = (ctypes.c_ubyte * (w * h * 4))()
-        rows = gdi32.GetDIBits(mem_dc, bmp, 0, h, ctypes.byref(buf), ctypes.byref(bmi), DIB_RGB_COLORS)
-        if rows != h:
-            return None
-
-        frame_bgra = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
-        frame_bgr = frame_bgra[:, :, :3].copy()
-        return frame_bgr, (left, top, right, bottom)
-    except Exception:
+    src_w = max(1, int(target_w))
+    src_h = max(1, int(target_h))
+    aspect = float(src_w) / float(max(1, src_h))
+    candidates: List[Tuple[int, Tuple[int, int, int, int]]] = []
+    for ar in areas:
+        l, t, r, b = ar
+        aw = int(r - l)
+        ah = int(b - t)
+        if aw < min_side or ah < min_side:
+            continue
+        candidates.append((aw * ah, ar))
+    if not candidates:
         return None
-    finally:
-        try:
-            if mem_dc.value and old_obj.value:
-                gdi32.SelectObject(mem_dc, old_obj)
-        except Exception:
-            pass
-        try:
-            if bmp.value:
-                gdi32.DeleteObject(bmp)
-        except Exception:
-            pass
-        try:
-            if mem_dc.value:
-                gdi32.DeleteDC(mem_dc)
-        except Exception:
-            pass
-        try:
-            if hwnd_dc.value:
-                user32.ReleaseDC(int(hwnd), hwnd_dc)
-        except Exception:
-            pass
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for _, ar in candidates:
+        l, t, r, b = ar
+        aw = int(r - l)
+        ah = int(b - t)
+        if aw <= 0 or ah <= 0:
+            continue
+
+        if float(aw) / float(max(1, ah)) >= aspect:
+            h = ah
+            w = int(round(float(h) * aspect))
+        else:
+            w = aw
+            h = int(round(float(w) / max(1e-6, aspect)))
+
+        w = max(min_side, min(aw, w))
+        h = max(min_side, min(ah, h))
+        w = max(2, w - (w % 2))
+        h = max(2, h - (h % 2))
+        if w > aw or h > ah:
+            continue
+
+        nl = l + max(0, (aw - w) // 2)
+        nt = t + max(0, (ah - h) // 2)
+        nr = nl + w
+        nb = nt + h
+        return int(nl), int(nt), int(nr), int(nb)
+
+    return None
 
 
-def capture_window_bgr_pil(hwnd: int) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    rect = get_window_rect(hwnd)
-    if rect is None:
-        return None
-    left, top, right, bottom = rect
-
-    img = None
-    try:
-        # Prefer direct window capture to avoid recursive self-capture from overlay.
-        img = ImageGrab.grab(window=int(hwnd), include_layered_windows=False)
-    except TypeError:
-        img = None
-    except Exception:
-        img = None
-
-    if img is None:
-        try:
-            img = ImageGrab.grab(
-                bbox=(left, top, right, bottom),
-                include_layered_windows=False,
-                all_screens=True,
-            )
-        except Exception:
-            return None
-
-    frame_rgb = np.array(img)
-    if frame_rgb.ndim != 3 or frame_rgb.shape[2] < 3:
-        return None
-    if frame_rgb.shape[2] == 4:
-        frame_rgb = frame_rgb[:, :, :3]
-
-    w = max(1, right - left)
-    h = max(1, bottom - top)
-    if frame_rgb.shape[1] != w or frame_rgb.shape[0] != h:
-        interp = cv2.INTER_AREA if (frame_rgb.shape[1] > w or frame_rgb.shape[0] > h) else cv2.INTER_CUBIC
-        frame_rgb = cv2.resize(frame_rgb, (w, h), interpolation=interp)
-
-    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR), (left, top, right, bottom)
+def enumerate_windows() -> List[CaptureWindowInfo]:
+    # Keep legacy entrypoint compatible while delegating to the modular capture module.
+    return capture_enumerate_windows()
 
 
 def capture_window_bgr(
     hwnd: int,
     backend: str = DEFAULT_CAPTURE_BACKEND,
+    allow_fallback: bool = True,
 ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    token = (backend or DEFAULT_CAPTURE_BACKEND).strip().lower()
-    if token == "pil":
-        frame = capture_window_bgr_pil(hwnd)
-        if frame is not None:
-            return frame
-        return capture_window_bgr_gdi(hwnd)
-
-    frame = capture_window_bgr_gdi(hwnd)
-    if frame is not None:
-        return frame
-    return capture_window_bgr_pil(hwnd)
+    # Keep legacy entrypoint compatible while delegating to the modular DXGI pipeline.
+    return capture_window_bgr_mod(hwnd, backend=backend, allow_fallback=allow_fallback)
 
 
 def parse_float(text: str, fallback: float) -> float:
@@ -810,10 +642,24 @@ def np_dtype_from_element_type(element_type: Any):
     return np.float32
 
 
-def to_nchw_tensor(image_bgr: np.ndarray, c: int, h: int, w: int, dtype) -> np.ndarray:
+def to_nchw_tensor(
+    image_bgr: np.ndarray,
+    c: int,
+    h: int,
+    w: int,
+    dtype,
+    resize_interpolation: Optional[int] = None,
+) -> np.ndarray:
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     if rgb.shape[0] != h or rgb.shape[1] != w:
-        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        if resize_interpolation is None:
+            if rgb.shape[0] > h or rgb.shape[1] > w:
+                interp = cv2.INTER_AREA
+            else:
+                interp = cv2.INTER_CUBIC
+        else:
+            interp = int(resize_interpolation)
+        rgb = cv2.resize(rgb, (w, h), interpolation=interp)
 
     if c == 1:
         rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[:, :, None]
@@ -1474,6 +1320,113 @@ def reduce_fg_ghosting(
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
 
 
+def guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    r = max(1, int(radius))
+    k = (r * 2 + 1, r * 2 + 1)
+    e = max(1e-6, float(eps))
+
+    mean_i = cv2.boxFilter(guide, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_ip = cv2.boxFilter(guide * src, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    cov_ip = mean_ip - mean_i * mean_p
+
+    mean_ii = cv2.boxFilter(guide * guide, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    var_i = mean_ii - mean_i * mean_i
+
+    a = cov_ip / (var_i + e)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    return mean_a * guide + mean_b
+
+
+def refine_fg_static_detail(
+    mid: np.ndarray,
+    frame0: np.ndarray,
+    frame1: np.ndarray,
+    timestep: float,
+    model_scale_ratio: float,
+) -> np.ndarray:
+    if (
+        mid is None
+        or frame0 is None
+        or frame1 is None
+        or mid.ndim != 3
+        or frame0.ndim != 3
+        or frame1.ndim != 3
+    ):
+        return mid
+
+    if frame0.shape[:2] != mid.shape[:2]:
+        frame0 = cv2.resize(frame0, (mid.shape[1], mid.shape[0]), interpolation=cv2.INTER_CUBIC)
+    if frame1.shape[:2] != mid.shape[:2]:
+        frame1 = cv2.resize(frame1, (mid.shape[1], mid.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    ratio = max(1.0, float(model_scale_ratio))
+    t = float(np.clip(timestep, 0.0, 1.0))
+
+    h, w = int(mid.shape[0]), int(mid.shape[1])
+    proc_max_side = 160
+    proc_scale = min(1.0, float(proc_max_side) / float(max(1, max(h, w))))
+    pw = max(16, int(round(w * proc_scale)))
+    ph = max(16, int(round(h * proc_scale)))
+    pw = max(2, pw - (pw % 2))
+    ph = max(2, ph - (ph % 2))
+
+    if pw != w or ph != h:
+        frame0_s = cv2.resize(frame0, (pw, ph), interpolation=cv2.INTER_AREA)
+        frame1_s = cv2.resize(frame1, (pw, ph), interpolation=cv2.INTER_AREA)
+    else:
+        frame0_s = frame0
+        frame1_s = frame1
+
+    diff_s = cv2.absdiff(frame0_s, frame1_s)
+    motion_s = cv2.cvtColor(diff_s, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    motion_s = cv2.GaussianBlur(motion_s, (0, 0), 1.1)
+    motion_mean = float(np.mean(motion_s))
+    static_conf = float(np.clip((18.0 - motion_mean) / 18.0, 0.0, 1.0))
+    if static_conf <= 1e-3:
+        return mid
+
+    if pw != w or ph != h:
+        mid_s = cv2.resize(mid, (pw, ph), interpolation=cv2.INTER_AREA)
+    else:
+        mid_s = mid
+
+    base_s = cv2.addWeighted(frame0_s, 1.0 - t, frame1_s, t, 0.0)
+
+    y_mid_s = cv2.cvtColor(mid_s, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    y_base_s = cv2.cvtColor(base_s, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    static_mask_s = np.clip((20.0 - motion_s) / 20.0, 0.0, 1.0)
+
+    gx = cv2.Sobel(y_base_s, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(y_base_s, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gx, gy)
+    edge_mask_s = np.clip((grad - 0.015) / 0.090, 0.0, 1.0)
+
+    radius = int(np.clip(round(1.0 + ratio * 0.22), 1, 2))
+    eps = float(np.clip(0.0009 + ratio * 0.00016, 0.0009, 0.0025))
+    low_base_s = cv2.GaussianBlur(y_base_s, (0, 0), sigmaX=1.0 + (0.10 * ratio), sigmaY=1.0 + (0.10 * ratio))
+    low_mid_s = guided_filter_gray(y_base_s, y_mid_s, radius=radius, eps=eps)
+    detail_delta_s = (y_base_s - low_base_s) - (y_mid_s - low_mid_s)
+
+    ratio_gain = float(np.clip((ratio - 1.0) / 6.0, 0.0, 1.0))
+    gain = (0.10 + (0.35 * ratio_gain)) * static_conf
+    delta_s = np.clip(gain * static_mask_s * edge_mask_s * detail_delta_s, -0.18, 0.18)
+
+    if pw != w or ph != h:
+        delta = cv2.resize(delta_s, (w, h), interpolation=cv2.INTER_CUBIC)
+    else:
+        delta = delta_s
+
+    mid_ycc = cv2.cvtColor(mid, cv2.COLOR_BGR2YCrCb)
+    y_plane = mid_ycc[:, :, 0].astype(np.int16)
+    y_plane = y_plane + np.rint(delta * 255.0).astype(np.int16)
+    mid_ycc[:, :, 0] = np.clip(y_plane, 0, 255).astype(np.uint8)
+    out = cv2.cvtColor(mid_ycc, cv2.COLOR_YCrCb2BGR)
+    return out
+
+
 def run_fg_mid(
     frame0: np.ndarray,
     frame1: np.ndarray,
@@ -1522,7 +1475,6 @@ def run_fg_mid(
 
     y = outputs[out_name] if out_name in outputs else next(iter(outputs.values()))
     mid = postprocess_tensor(np.asarray(y))
-    mid = reduce_fg_ghosting(mid=mid, frame0=frame0, frame1=frame1, strength=0.18)
     return mid, (t1 - t0) * 1000.0
 
 
@@ -1753,199 +1705,6 @@ def run_ov_infer_tiled(
     return dst, avg_tile_ms
 
 
-class OverlayWindow:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.win: Optional[tk.Toplevel] = None
-        self.label: Optional[tk.Label] = None
-        self.photo: Optional[ImageTk.PhotoImage] = None
-        self.hwnd: int = 0
-        self.visible = False
-
-    def _ensure(self):
-        if self.win is not None:
-            return
-        self.win = tk.Toplevel(self.root)
-        self.win.withdraw()
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.label = tk.Label(self.win, bd=0, highlightthickness=0)
-        self.label.pack(fill=tk.BOTH, expand=True)
-        self.win.update_idletasks()
-        self.hwnd = int(self.win.winfo_id())
-
-    def hide(self):
-        if self.win is not None:
-            self.win.withdraw()
-        self.visible = False
-
-    def show_frame(
-        self,
-        frame_bgr: np.ndarray,
-        rect: Tuple[int, int, int, int],
-        alpha: float,
-        click_through: bool,
-        exclude_from_capture: bool,
-        target_hwnd: int = 0,
-    ) -> None:
-        self._ensure()
-        assert self.win is not None
-        assert self.label is not None
-
-        left, top, right, bottom = rect
-        w = max(1, int(right - left))
-        h = max(1, int(bottom - top))
-        if frame_bgr.shape[1] != w or frame_bgr.shape[0] != h:
-            interp = cv2.INTER_AREA if (frame_bgr.shape[1] > w or frame_bgr.shape[0] > h) else cv2.INTER_CUBIC
-            frame_bgr = cv2.resize(frame_bgr, (w, h), interpolation=interp)
-
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.label.configure(image=self.photo)
-
-        self.win.geometry(f"{w}x{h}+{left}+{top}")
-        self.win.attributes("-topmost", True)
-
-        a = max(0.2, min(1.0, float(alpha)))
-        if self.hwnd:
-            ex_style = int(user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE))
-            ex_style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-            if click_through:
-                ex_style |= WS_EX_TRANSPARENT
-            else:
-                ex_style &= ~WS_EX_TRANSPARENT
-            user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex_style)
-            # Disable window input path entirely when click-through is enabled.
-            try:
-                user32.EnableWindow(self.hwnd, ctypes.c_bool(not click_through))
-            except Exception:
-                pass
-            # Force style re-apply and keep topmost without activating focus.
-            user32.SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                left,
-                top,
-                w,
-                h,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            )
-            user32.SetLayeredWindowAttributes(
-                self.hwnd,
-                0,
-                int(round(a * 255.0)),
-                LWA_ALPHA,
-            )
-            try:
-                user32.SetWindowDisplayAffinity(
-                    self.hwnd,
-                    WDA_EXCLUDEFROMCAPTURE if exclude_from_capture else WDA_NONE,
-                )
-            except Exception:
-                pass
-
-            if click_through and target_hwnd > 0:
-                try:
-                    fg_hwnd = int(user32.GetForegroundWindow())
-                    root_hwnd = int(self.root.winfo_id())
-                    if fg_hwnd == self.hwnd or fg_hwnd == root_hwnd:
-                        user32.SetForegroundWindow(int(target_hwnd))
-                except Exception:
-                    pass
-        else:
-            self.win.attributes("-alpha", a)
-
-        if not self.visible:
-            self.win.deiconify()
-        self.visible = True
-
-
-class LatestCapturePump:
-    def __init__(
-        self,
-        get_cfg_fn,
-        stop_event: threading.Event,
-        buffer_size: int = CAPTURE_FRAME_BUFFER_SIZE,
-    ):
-        self.get_cfg_fn = get_cfg_fn
-        self.stop_event = stop_event
-        self.lock = threading.Lock()
-        self.cond = threading.Condition(self.lock)
-        self.buffer = deque(maxlen=max(1, int(buffer_size)))
-        self.latest_frame: Optional[np.ndarray] = None
-        self.latest_rect: Optional[Tuple[int, int, int, int]] = None
-        self.latest_id: int = 0
-        self.latest_ts: float = 0.0
-        self.last_error: str = ""
-        self.last_error_ts: float = 0.0
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        if not self.thread.is_alive():
-            self.thread.start()
-
-    def join(self, timeout: float = 1.0) -> None:
-        try:
-            self.thread.join(timeout=max(0.0, float(timeout)))
-        except Exception:
-            pass
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                cfg = self.get_cfg_fn()
-                hwnd = int(getattr(cfg, "hwnd", 0))
-                backend = str(getattr(cfg, "capture_backend", DEFAULT_CAPTURE_BACKEND))
-            except Exception:
-                time.sleep(0.01)
-                continue
-
-            if hwnd <= 0:
-                time.sleep(0.01)
-                continue
-
-            captured = capture_window_bgr(hwnd, backend=backend)
-            now = time.perf_counter()
-            if captured is None:
-                self.last_error = "capture_failed"
-                self.last_error_ts = now
-                time.sleep(0.003)
-                continue
-
-            frame, rect = captured
-            with self.cond:
-                self.latest_id += 1
-                frame_id = int(self.latest_id)
-                self.buffer.append((frame_id, float(now), frame, rect))
-                self.latest_frame = frame
-                self.latest_rect = rect
-                self.latest_ts = now
-                self.cond.notify_all()
-            self.last_error = ""
-
-    def get_latest_after(
-        self,
-        min_id: int,
-        wait_timeout_s: float = 0.008,
-    ) -> Optional[Tuple[int, float, np.ndarray, Tuple[int, int, int, int]]]:
-        timeout_s = max(0.0, float(wait_timeout_s))
-        deadline = time.perf_counter() + timeout_s
-        with self.cond:
-            while True:
-                if self.buffer:
-                    latest = self.buffer[-1]
-                    if int(latest[0]) > int(min_id):
-                        return latest
-
-                remain = deadline - time.perf_counter()
-                if remain <= 0.0:
-                    return None
-                self.cond.wait(timeout=remain)
-
-    def latest_error(self) -> str:
-        return self.last_error
-
-
 class LunaRealtimeWorker(threading.Thread):
     def __init__(
         self,
@@ -2133,7 +1892,7 @@ class LunaRealtimeWorker(threading.Thread):
         frame_idx = 0
         last_tick = time.perf_counter()
         seed_base = int(time.time() * 1000.0) & 0xFFFFFFFF
-        capture_pump = LatestCapturePump(self._current_config, self.stop_event)
+        capture_pump = CapturePump(self._current_config, self.stop_event)
         capture_pump.start()
         last_capture_id = 0
         last_capture_warn_ts = 0.0
@@ -2148,6 +1907,9 @@ class LunaRealtimeWorker(threading.Thread):
         temporal_prev_out: Optional[np.ndarray] = None
         temporal_failure_note_shown = False
         bench_failure_note_shown = False
+        zoom_guard_note_shown = False
+        detached_overlay_note_shown = False
+        inplace_overlay_note_shown = False
         tuned = False
         fallback_stage = 0
         reactive_scale_cur = float(DEFAULT_OV_INTERNAL_SCALE)
@@ -2185,6 +1947,7 @@ class LunaRealtimeWorker(threading.Thread):
                 bool(cfg.overlay_click_through),
                 bool(cfg.overlay_exclude_from_capture),
                 bool(cfg.overlay_fullscreen_upscale),
+                bool(cfg.overlay_force_inplace),
                 bool(cfg.fg_enabled),
                 bool(cfg.fg_interp_only),
                 cfg.fg_model,
@@ -2205,95 +1968,34 @@ class LunaRealtimeWorker(threading.Thread):
                 temporal_prev_out = None
                 temporal_failure_note_shown = False
                 bench_failure_note_shown = False
+                zoom_guard_note_shown = False
+                detached_overlay_note_shown = False
+                inplace_overlay_note_shown = False
                 last_capture_warn_ts = 0.0
                 try:
                     self._ensure_benchmark_writer(cfg)
                 except Exception as e:
                     self._close_benchmark_writer()
                     self._push_status({"warning": f"Benchmark logger setup failed: {e}"})
-                backend_note = ""
-                if cfg.backend == "lunasr":
-                    try:
-                        luna_runtime = build_luna_runtime(cfg.preset, cfg.frame_budget_ms)
-                        ov_runtime = None
-                        backend_note = str(luna_runtime["note"])
-                    except Exception as e:
-                        self._push_status({"error": f"LunaSR setup failed: {e}"})
-                        time.sleep(0.2)
-                        continue
-                elif cfg.backend == "openvino_sr":
-                    try:
-                        ov_runtime = compile_ov_runtime(
-                            model_path=cfg.ov_model,
-                            device=cfg.device,
-                            preset=cfg.ov_preset,
-                            cache_dir=cfg.ov_cache_dir,
-                            allow_cpu_fallback=bool(cfg.allow_cpu_fallback),
-                            strict_npu_only=bool(cfg.strict_npu_only),
-                            strict_gpu_only=bool(cfg.strict_gpu_only),
-                        )
-                        luna_runtime = None
-                        backend_note = (
-                            f"backend=openvino_sr, device={cfg.device}, preset={cfg.ov_preset}, "
-                            f"capture={cfg.capture_backend}, output={cfg.output_preset}, "
-                            f"gpu_video={'cuda' if (cfg.gpu_video_path and CUDA_AVAILABLE) else 'cpu'}, "
-                            f"reactive={'on' if cfg.ov_reactive_scale else 'off'}@{cfg.ov_reactive_target_fps:.0f}fps, "
-                            f"temporal={'on' if cfg.temporal_restore else 'off'}@{cfg.temporal_strength:.2f}, "
-                            f"dpi={DPI_AWARENESS_MODE}, "
-                            f"npu_i8={'on' if 'NPU' in str(ov_runtime['compile_device']).upper() else 'off'}, "
-                            f"gpu_tile_base_720p={'on' if 'GPU' in str(ov_runtime['compile_device']).upper() else 'off'}, "
-                            f"cpu_fallback={'on' if cfg.allow_cpu_fallback else 'off'}, "
-                            f"strict_npu={'on' if cfg.strict_npu_only else 'off'}, "
-                            f"strict_gpu={'on' if cfg.strict_gpu_only else 'off'}, "
-                            f"temporal_model={'on' if ov_runtime.get('temporal_model', False) else 'off'}, "
-                            f"model={ov_runtime['model_path']}, compile_device={ov_runtime['compile_device']}, "
-                            f"exec={ov_runtime['exec_devices']}, "
-                            f"req_pool={ov_runtime.get('ov_parallel_reqs', 1)}, "
-                            f"compile_ms={ov_runtime['compile_ms']:.1f}"
-                        )
-                        if ov_runtime["compile_note"]:
-                            backend_note = backend_note + f" | {ov_runtime['compile_note']}"
-                    except Exception as e:
-                        self._push_status({"error": f"OpenVINO setup failed: {e}"})
-                        time.sleep(0.3)
-                        continue
-                else:
-                    self._push_status({"error": f"Unknown backend: {cfg.backend}"})
-                    time.sleep(0.2)
+                try:
+                    backend_bundle = build_backend_bundle(
+                        cfg,
+                        build_luna_runtime_fn=build_luna_runtime,
+                        compile_ov_runtime_fn=compile_ov_runtime,
+                        compile_fg_runtime_fn=compile_fg_runtime,
+                        cuda_available=CUDA_AVAILABLE,
+                        dpi_awareness_mode=DPI_AWARENESS_MODE,
+                    )
+                    luna_runtime = backend_bundle.luna_runtime
+                    ov_runtime = backend_bundle.ov_runtime
+                    fg_runtime = backend_bundle.fg_runtime
+                    for warn in backend_bundle.warnings:
+                        self._push_status({"warning": warn})
+                    self._push_status({"profile_note": backend_bundle.profile_note})
+                except Exception as e:
+                    self._push_status({"error": f"Backend setup failed: {e}"})
+                    time.sleep(0.3)
                     continue
-
-                fg_note = "fg=off"
-                if cfg.fg_enabled:
-                    try:
-                        fg_runtime = compile_fg_runtime(
-                            model_path=cfg.fg_model,
-                            device=cfg.device,
-                            cache_dir=cfg.ov_cache_dir,
-                            precision=cfg.fg_precision,
-                            fg_size=cfg.fg_size,
-                            allow_cpu_fallback=bool(cfg.allow_cpu_fallback),
-                            strict_npu_only=bool(cfg.strict_npu_only),
-                            strict_gpu_only=bool(cfg.strict_gpu_only),
-                        )
-                        fg_note = (
-                            f"fg=on model={fg_runtime['model_path']} "
-                            f"prec={fg_runtime['precision']} size={fg_runtime['fg_size']} "
-                            f"compile_device={fg_runtime['compile_device']} "
-                            f"exec={fg_runtime['exec_devices']} "
-                            f"compile_ms={fg_runtime['compile_ms']:.1f}"
-                        )
-                        if fg_runtime["compile_note"]:
-                            fg_note = fg_note + f" | {fg_runtime['compile_note']}"
-                        if cfg.fg_interp_only:
-                            fg_note = fg_note + " mode=interp_only"
-                    except Exception as e:
-                        fg_runtime = None
-                        fg_note = f"fg=on setup_failed: {e}"
-                        self._push_status({"warning": f"FG setup failed, fallback=blend: {e}"})
-                else:
-                    fg_runtime = None
-
-                self._push_status({"profile_note": f"{backend_note} | {fg_note}"})
 
             latest = capture_pump.get_latest_after(last_capture_id, wait_timeout_s=0.010)
             if latest is None:
@@ -2304,6 +2006,8 @@ class LunaRealtimeWorker(threading.Thread):
                         self._push_status({"warning": f"Capture waiting: {cap_err}"})
                     else:
                         self._push_status({"warning": "Capture waiting: no new frame yet."})
+                    # Avoid showing stale frozen overlay when capture stream stalls.
+                    self._push_status({"overlay_hide": True})
                     last_capture_warn_ts = now_wait
                 continue
             capture_id, capture_ts, frame, src_rect = latest
@@ -2318,6 +2022,7 @@ class LunaRealtimeWorker(threading.Thread):
             temporal_ms = 0.0
             work_frame = frame
             use_gpu_video = bool(cfg.gpu_video_path and CUDA_AVAILABLE and cfg.backend == "openvino_sr")
+            strict_npu_pipeline = bool(cfg.strict_npu_only)
             target_w, target_h = resolve_target_size_from_preset(
                 src_w=int(frame.shape[1]),
                 src_h=int(frame.shape[0]),
@@ -2334,21 +2039,57 @@ class LunaRealtimeWorker(threading.Thread):
                                 fg_ctx=fg_runtime,
                                 timestep=float(cfg.fg_timestep),
                             )
+                            fg_post_t0 = time.perf_counter()
+                            scale_ratio = max(
+                                float(frame.shape[1]) / float(max(1, fg_mid.shape[1])),
+                                float(frame.shape[0]) / float(max(1, fg_mid.shape[0])),
+                            )
                             if fg_mid.shape[1] != frame.shape[1] or fg_mid.shape[0] != frame.shape[0]:
+                                upscale_interp = cv2.INTER_CUBIC
+                                if scale_ratio >= 2.0:
+                                    upscale_interp = cv2.INTER_LANCZOS4
                                 fg_mid = resize_bgr(
                                     fg_mid,
                                     (frame.shape[1], frame.shape[0]),
-                                    cv2.INTER_CUBIC,
+                                    upscale_interp,
                                     use_cuda=use_gpu_video,
                                 )
+                            if not strict_npu_pipeline:
+                                ghost_strength = 0.12 + (
+                                    0.08 * float(np.clip((scale_ratio - 1.0) / 4.0, 0.0, 1.0))
+                                )
+                                fg_mid = reduce_fg_ghosting(
+                                    mid=fg_mid,
+                                    frame0=fg_prev_frame,
+                                    frame1=frame,
+                                    strength=ghost_strength,
+                                )
+                                if scale_ratio >= 1.25:
+                                    fg_mid = refine_fg_static_detail(
+                                        mid=fg_mid,
+                                        frame0=fg_prev_frame,
+                                        frame1=frame,
+                                        timestep=float(cfg.fg_timestep),
+                                        model_scale_ratio=scale_ratio,
+                                    )
+                            fg_ms += (time.perf_counter() - fg_post_t0) * 1000.0
                             work_frame = fg_mid
                         except Exception as e:
-                            work_frame = cv2.addWeighted(fg_prev_frame, 0.5, frame, 0.5, 0.0)
+                            if strict_npu_pipeline:
+                                work_frame = frame
+                            else:
+                                work_frame = cv2.addWeighted(fg_prev_frame, 0.5, frame, 0.5, 0.0)
                             if not fg_failure_note_shown:
-                                self._push_status({"warning": f"FG infer failed, fallback=blend: {e}"})
+                                if strict_npu_pipeline:
+                                    self._push_status({"warning": f"FG infer failed, fallback=passthrough: {e}"})
+                                else:
+                                    self._push_status({"warning": f"FG infer failed, fallback=blend: {e}"})
                                 fg_failure_note_shown = True
                     else:
-                        work_frame = cv2.addWeighted(fg_prev_frame, 0.5, frame, 0.5, 0.0)
+                        if strict_npu_pipeline:
+                            work_frame = frame
+                        else:
+                            work_frame = cv2.addWeighted(fg_prev_frame, 0.5, frame, 0.5, 0.0)
                 fg_prev_frame = frame.copy()
             else:
                 fg_prev_frame = None
@@ -2527,7 +2268,7 @@ class LunaRealtimeWorker(threading.Thread):
                 and ov_runtime is not None
                 and bool(ov_runtime.get("temporal_model", False))
             )
-            if use_sr and bool(cfg.temporal_restore) and not temporal_in_model:
+            if use_sr and bool(cfg.temporal_restore) and (not bool(cfg.strict_npu_only)) and not temporal_in_model:
                 raw_out = out
                 if temporal_prev_out is not None:
                     try:
@@ -2571,42 +2312,113 @@ class LunaRealtimeWorker(threading.Thread):
                         reactive_scale_cur = new_scale
                         reactive_last_adjust_frame = frame_idx
 
+            monitor_rect = capture_get_monitor_rect_for_window(cfg.hwnd)
+            strict_accel_dxgi = bool(
+                use_sr
+                and bool(cfg.strict_npu_only or cfg.strict_gpu_only)
+                and str(cfg.capture_backend).strip().lower() == "dxgi"
+            )
             overlay_rect = src_rect
-            if cfg.overlay_fullscreen_upscale and use_sr:
-                monitor_rect = get_monitor_rect_for_window(cfg.hwnd)
-                if monitor_rect is not None:
-                    overlay_rect = monitor_rect
-            elif use_sr:
-                monitor_rect = get_monitor_rect_for_window(cfg.hwnd)
-                overlay_rect = build_centered_overlay_rect(
-                    src_rect=src_rect,
-                    target_w=target_w,
-                    target_h=target_h,
-                    bounds_rect=monitor_rect,
-                )
+            overlay_visible = True
 
-            ow = max(1, int(overlay_rect[2] - overlay_rect[0]))
-            oh = max(1, int(overlay_rect[3] - overlay_rect[1]))
-            if out.shape[1] != ow or out.shape[0] != oh:
-                interp = cv2.INTER_AREA if (out.shape[1] > ow or out.shape[0] > oh) else cv2.INTER_CUBIC
-                overlay_frame = resize_bgr(
-                    out,
-                    (ow, oh),
-                    interp,
-                    use_cuda=use_gpu_video,
+            if use_sr:
+                if strict_accel_dxgi:
+                    if bool(cfg.overlay_force_inplace):
+                        overlay_rect = src_rect
+                        if not inplace_overlay_note_shown:
+                            self._push_status(
+                                {
+                                    "warning": (
+                                        "Strict DXGI mode: in-place overlay is forced on target window. "
+                                        "This can cause feedback blur if capture exclusion fails."
+                                    )
+                                }
+                            )
+                            inplace_overlay_note_shown = True
+                    else:
+                        detached = build_detached_preview_rect(
+                            src_rect=src_rect,
+                            target_w=target_w,
+                            target_h=target_h,
+                            monitor_rect=monitor_rect,
+                        )
+                        if detached is not None:
+                            overlay_rect = detached
+                        else:
+                            overlay_visible = False
+                            if not detached_overlay_note_shown:
+                                self._push_status(
+                                    {
+                                        "warning": (
+                                            "Strict DXGI mode: no safe area outside target window for preview. "
+                                            "Overlay is hidden to protect game input/capture. "
+                                            "Use windowed mode or another monitor to display SR output."
+                                        )
+                                    }
+                                )
+                                detached_overlay_note_shown = True
+                elif cfg.overlay_fullscreen_upscale:
+                    if monitor_rect is not None:
+                        overlay_rect = monitor_rect
+                else:
+                    overlay_rect = build_centered_overlay_rect(
+                        src_rect=src_rect,
+                        target_w=target_w,
+                        target_h=target_h,
+                        bounds_rect=monitor_rect,
+                    )
+
+            # Guard against DXGI self-capture feedback zoom in strict accel mode.
+            if (
+                overlay_visible
+                and strict_accel_dxgi
+                and bool(cfg.overlay_exclude_from_capture)
+            ):
+                src_w = max(1, int(src_rect[2] - src_rect[0]))
+                src_h = max(1, int(src_rect[3] - src_rect[1]))
+                ov_w = max(1, int(overlay_rect[2] - overlay_rect[0]))
+                ov_h = max(1, int(overlay_rect[3] - overlay_rect[1]))
+                sl, st, sr, sb = src_rect
+                ol, ot, or_, ob = overlay_rect
+                overlap = not (or_ <= sl or ol >= sr or ob <= st or ot >= sb)
+                if overlap and (ov_w > src_w or ov_h > src_h):
+                    overlay_rect = src_rect
+                    if not zoom_guard_note_shown:
+                        self._push_status(
+                            {
+                                "warning": (
+                                    "DXGI strict mode zoom guard enabled: "
+                                    "overlay display is clamped to source size to prevent feedback enlargement."
+                                )
+                            }
+                        )
+                        zoom_guard_note_shown = True
+
+            if overlay_visible:
+                ow = max(1, int(overlay_rect[2] - overlay_rect[0]))
+                oh = max(1, int(overlay_rect[3] - overlay_rect[1]))
+                if out.shape[1] != ow or out.shape[0] != oh:
+                    interp = cv2.INTER_AREA if (out.shape[1] > ow or out.shape[0] > oh) else cv2.INTER_CUBIC
+                    overlay_frame = resize_bgr(
+                        out,
+                        (ow, oh),
+                        interp,
+                        use_cuda=use_gpu_video,
+                    )
+                else:
+                    overlay_frame = out
+                self._push_overlay(
+                    {
+                        "frame": overlay_frame,
+                        "rect": overlay_rect,
+                        "alpha": float(cfg.overlay_alpha),
+                        "click_through": True,
+                        "exclude_from_capture": bool(cfg.overlay_exclude_from_capture),
+                        "target_hwnd": int(cfg.hwnd),
+                    }
                 )
             else:
-                overlay_frame = out
-            self._push_overlay(
-                {
-                    "frame": overlay_frame,
-                    "rect": overlay_rect,
-                    "alpha": float(cfg.overlay_alpha),
-                    "click_through": True,
-                    "exclude_from_capture": bool(cfg.overlay_exclude_from_capture),
-                    "target_hwnd": int(cfg.hwnd),
-                }
-            )
+                self._push_status({"overlay_hide": True})
 
             ov_scale_now = reactive_scale_cur if bool(cfg.ov_reactive_scale) else float(cfg.ov_internal_scale)
             ov_parallel_reqs_now = int(ov_runtime.get("ov_parallel_reqs", 1)) if ov_runtime is not None else 1
@@ -2667,7 +2479,12 @@ class LunaRealtimeGui:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("LunaSR Realtime GUI")
-        self.root.geometry("1120x400")
+        screen_w = max(1024, int(self.root.winfo_screenwidth()))
+        screen_h = max(720, int(self.root.winfo_screenheight()))
+        win_w = max(980, min(1760, screen_w - 80))
+        win_h = max(520, min(980, screen_h - 120))
+        self.root.geometry(f"{win_w}x{win_h}+20+20")
+        self.root.minsize(980, 520)
 
         self.config_lock = threading.Lock()
         self.config_holder: Dict[str, RuntimeConfig] = {
@@ -2704,13 +2521,23 @@ class LunaRealtimeGui:
                 fg_precision="f16",
                 fg_size=256,
                 fg_timestep=0.50,
+                overlay_force_inplace=DEFAULT_FORCE_INPLACE_OVERLAY,
             )
         }
         self.status_q: queue.Queue = queue.Queue(maxsize=64)
         self.overlay_q: queue.Queue = queue.Queue(maxsize=1)
         self.worker: Optional[LunaRealtimeWorker] = None
-        self.overlay_window = OverlayWindow(self.root)
+        self.overlay_window = RealtimeOverlayWindow(self.root)
         self.window_map: Dict[str, int] = {}
+        self.ui_canvas: Optional[tk.Canvas] = None
+        self.ui_frame: Optional[ttk.Frame] = None
+        self.ui_window_id: Optional[int] = None
+        self.refresh_btn: Optional[ttk.Button] = None
+        self._shutting_down = False
+        self._tray_icon_added = False
+        self._tray_nid = NOTIFYICONDATAW()
+        self._hotkey_toggle_registered = False
+        self._hotkey_showhide_registered = False
 
         self.target_var = tk.StringVar()
         self.backend_var = tk.StringVar(value="openvino_sr")
@@ -2739,6 +2566,7 @@ class LunaRealtimeGui:
         self.overlay_click_var = tk.BooleanVar(value=True)
         self.overlay_exclude_var = tk.BooleanVar(value=True)
         self.overlay_fullscreen_var = tk.BooleanVar(value=False)
+        self.overlay_inplace_var = tk.BooleanVar(value=DEFAULT_FORCE_INPLACE_OVERLAY)
         self.fg_var = tk.BooleanVar(value=False)
         self.fg_interp_only_var = tk.BooleanVar(value=False)
         self.fg_model_var = tk.StringVar(value=DEFAULT_FG_MODEL)
@@ -2762,11 +2590,196 @@ class LunaRealtimeGui:
         self._sync_runtime_config()
         self._poll_status_queue()
         self._poll_overlay_queue()
+        self._init_native_controls()
+        self._poll_native_events()
+        self.root.bind("<Unmap>", self._on_root_unmap)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def _init_native_controls(self):
+        self.root.update_idletasks()
+        self._ensure_tray_icon()
+        self._register_global_hotkeys()
+        self._update_tray_tip(running=False)
+
+    def _make_tray_nid(self, *, tip: str, flags: int) -> NOTIFYICONDATAW:
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = int(self.root.winfo_id())
+        nid.uID = 1
+        nid.uFlags = int(flags)
+        nid.uCallbackMessage = TRAY_CALLBACK_MSG
+        nid.hIcon = user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+        nid.szTip = (tip or "LunaSR Realtime")[:127]
+        return nid
+
+    def _ensure_tray_icon(self):
+        if self._tray_icon_added:
+            return
+        nid = self._make_tray_nid(
+            tip="LunaSR Realtime | F8 Toggle | F9 Show/Hide",
+            flags=(NIF_MESSAGE | NIF_ICON | NIF_TIP),
+        )
+        ok = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)))
+        if ok:
+            self._tray_nid = nid
+            self._tray_icon_added = True
+        else:
+            err = int(ctypes.get_last_error())
+            self.status_main_var.set(f"Tray icon init failed (err={err}).")
+
+    def _update_tray_tip(self, *, running: bool):
+        if not self._tray_icon_added:
+            return
+        mode = "RUNNING" if running else "IDLE"
+        nid = self._make_tray_nid(
+            tip=f"LunaSR {mode} | F8 Toggle | F9 Show/Hide",
+            flags=(NIF_TIP | NIF_ICON),
+        )
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def _remove_tray_icon(self):
+        if not self._tray_icon_added:
+            return
+        nid = self._make_tray_nid(tip="LunaSR Realtime", flags=0)
+        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+        self._tray_icon_added = False
+
+    def _register_global_hotkeys(self):
+        if not self._hotkey_toggle_registered:
+            self._hotkey_toggle_registered = bool(
+                user32.RegisterHotKey(None, HOTKEY_ID_TOGGLE, MOD_NOREPEAT, VK_F8)
+            )
+            if not self._hotkey_toggle_registered:
+                self.status_main_var.set("Global hotkey F8 registration failed (already in use).")
+        if not self._hotkey_showhide_registered:
+            self._hotkey_showhide_registered = bool(
+                user32.RegisterHotKey(None, HOTKEY_ID_SHOWHIDE, MOD_NOREPEAT, VK_F9)
+            )
+            if not self._hotkey_showhide_registered:
+                self.status_main_var.set("Global hotkey F9 registration failed (already in use).")
+
+    def _unregister_global_hotkeys(self):
+        if self._hotkey_toggle_registered:
+            user32.UnregisterHotKey(None, HOTKEY_ID_TOGGLE)
+            self._hotkey_toggle_registered = False
+        if self._hotkey_showhide_registered:
+            user32.UnregisterHotKey(None, HOTKEY_ID_SHOWHIDE)
+            self._hotkey_showhide_registered = False
+
+    def _select_foreground_target_if_empty(self):
+        with self.config_lock:
+            cfg = self.config_holder.get("cfg")
+            if cfg is not None and int(cfg.hwnd) > 0:
+                return
+        fg = int(user32.GetForegroundWindow() or 0)
+        if fg <= 0:
+            return
+        self.refresh_window_list()
+        for label, hwnd in self.window_map.items():
+            if int(hwnd) == fg:
+                self.target_var.set(label)
+                self._sync_runtime_config()
+                return
+
+    def _toggle_worker_global(self):
+        if self.worker is not None and self.worker.is_alive():
+            self.stop_worker(reason="Stopped by F8 global hotkey.")
+            return
+        self._select_foreground_target_if_empty()
+        self.start_worker()
+
+    def _toggle_gui_visibility(self):
+        if self.root.state() == "withdrawn":
+            self._restore_from_tray()
+        else:
+            self._hide_to_tray()
+
+    def _hide_to_tray(self):
+        self._ensure_tray_icon()
+        if self.root.state() != "withdrawn":
+            self.root.withdraw()
+        self.status_main_var.set("Running in tray. F8 toggle SR, F9 show/hide GUI.")
+
+    def _restore_from_tray(self):
+        self.root.deiconify()
+        try:
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _on_root_unmap(self, _event=None):
+        if self._shutting_down:
+            return
+        try:
+            if self.root.state() == "iconic":
+                self._hide_to_tray()
+        except Exception:
+            pass
+
+    def _poll_native_events(self):
+        if self._shutting_down:
+            return
+        msg = MSG()
+        while user32.PeekMessageW(ctypes.byref(msg), None, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
+            hotkey_id = int(msg.wParam)
+            if hotkey_id == HOTKEY_ID_TOGGLE:
+                self._toggle_worker_global()
+            elif hotkey_id == HOTKEY_ID_SHOWHIDE:
+                self._toggle_gui_visibility()
+
+        while user32.PeekMessageW(
+            ctypes.byref(msg),
+            None,
+            TRAY_CALLBACK_MSG,
+            TRAY_CALLBACK_MSG,
+            PM_REMOVE,
+        ):
+            event_id = int(msg.lParam)
+            if event_id in (WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP):
+                self._toggle_gui_visibility()
+
+        self.root.after(NATIVE_EVENT_POLL_INTERVAL_MS, self._poll_native_events)
+
+    def _on_ui_frame_configure(self, _event=None):
+        if self.ui_canvas is None:
+            return
+        bbox = self.ui_canvas.bbox("all")
+        if bbox is not None:
+            self.ui_canvas.configure(scrollregion=bbox)
+
+    def _on_ui_canvas_configure(self, event):
+        if self.ui_canvas is None or self.ui_frame is None or self.ui_window_id is None:
+            return
+        req_w = max(1, int(self.ui_frame.winfo_reqwidth()))
+        width = max(req_w, int(getattr(event, "width", req_w)))
+        self.ui_canvas.itemconfigure(self.ui_window_id, width=width)
+
     def _build_widgets(self):
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
+        container = ttk.Frame(self.root)
+        container.pack(fill=tk.BOTH, expand=True)
+        vsb = ttk.Scrollbar(container, orient=tk.VERTICAL)
+        hsb = ttk.Scrollbar(container, orient=tk.HORIZONTAL)
+        canvas = tk.Canvas(
+            container,
+            highlightthickness=0,
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
+        )
+        vsb.config(command=canvas.yview)
+        hsb.config(command=canvas.xview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        frame = ttk.Frame(canvas, padding=12)
+        ui_window_id = canvas.create_window((0, 0), window=frame, anchor=tk.NW)
+        self.ui_canvas = canvas
+        self.ui_frame = frame
+        self.ui_window_id = int(ui_window_id)
+        frame.bind("<Configure>", self._on_ui_frame_configure)
+        canvas.bind("<Configure>", self._on_ui_canvas_configure)
 
         row0 = ttk.Frame(frame)
         row0.pack(fill=tk.X, pady=(0, 8))
@@ -2774,7 +2787,8 @@ class LunaRealtimeGui:
         self.target_combo = ttk.Combobox(row0, textvariable=self.target_var, state="readonly", width=92)
         self.target_combo.pack(side=tk.LEFT, padx=(8, 8), fill=tk.X, expand=True)
         self.target_combo.bind("<<ComboboxSelected>>", self._on_control_changed)
-        ttk.Button(row0, text="Refresh", command=self.refresh_window_list).pack(side=tk.LEFT)
+        self.refresh_btn = ttk.Button(row0, text="Refresh", command=self.refresh_window_list)
+        self.refresh_btn.pack(side=tk.LEFT)
 
         row1 = ttk.Frame(frame)
         row1.pack(fill=tk.X, pady=(0, 8))
@@ -2824,7 +2838,7 @@ class LunaRealtimeGui:
         self.device_combo = ttk.Combobox(
             row2,
             textvariable=self.device_var,
-            values=["AUTO", "NPU", "GPU", "CPU"],
+            values=["NPU", "GPU"],
             state="readonly",
             width=8,
         )
@@ -2835,7 +2849,7 @@ class LunaRealtimeGui:
         self.capture_backend_combo = ttk.Combobox(
             row2,
             textvariable=self.capture_backend_var,
-            values=["gdi", "pil"],
+            values=list(SUPPORTED_CAPTURE_BACKENDS),
             state="readonly",
             width=6,
         )
@@ -2943,10 +2957,22 @@ class LunaRealtimeGui:
         )
         self.overlay_fullscreen_check.pack(side=tk.LEFT, padx=(0, 14))
 
+        self.overlay_inplace_check = ttk.Checkbutton(
+            row3,
+            text="Force in-place overlay",
+            variable=self.overlay_inplace_var,
+            command=self._on_control_changed,
+        )
+        self.overlay_inplace_check.pack(side=tk.LEFT, padx=(0, 14))
+
         self.start_btn = ttk.Button(row3, text="Start", command=self.start_worker)
         self.start_btn.pack(side=tk.LEFT)
         self.stop_btn = ttk.Button(row3, text="Stop", command=self.stop_worker, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.tray_btn = ttk.Button(row3, text="Tray", command=self._hide_to_tray)
+        self.tray_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.exit_btn = ttk.Button(row3, text="Exit", command=self.exit_app)
+        self.exit_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.help_btn = ttk.Button(row3, text="Help", command=self.show_help)
         self.help_btn.pack(side=tk.LEFT, padx=(8, 0))
 
@@ -2988,7 +3014,7 @@ class LunaRealtimeGui:
         ttk.Label(frame, textvariable=self.status_shape_var).pack(anchor=tk.W, pady=(0, 2))
 
     def refresh_window_list(self):
-        windows = enumerate_windows()
+        windows = capture_enumerate_windows()
         labels = [w.label for w in windows]
         self.window_map = {w.label: w.hwnd for w in windows}
         self.target_combo["values"] = labels
@@ -3031,35 +3057,25 @@ class LunaRealtimeGui:
         self.stop_worker(reason="Stopped by Alt+P.")
         return "break"
 
+    def _set_target_controls_enabled(self, enabled: bool):
+        try:
+            self.target_combo.config(state=("readonly" if enabled else tk.DISABLED))
+        except Exception:
+            pass
+        if self.refresh_btn is not None:
+            try:
+                self.refresh_btn.config(state=(tk.NORMAL if enabled else tk.DISABLED))
+            except Exception:
+                pass
+
     def show_help(self):
         messagebox.showinfo(
             "LunaSR Help",
-            "Controls:\n"
-            "- Start: begin realtime overlay processing.\n"
-            "- Stop: stop processing.\n"
-            "- Alt+P: stop hotkey (works while this GUI is active).\n\n"
-            "Modes:\n"
-            "- Backend: realtime is fixed to openvino_sr (strict NPU compile path).\n"
-            "- Upscale ON: SR pipeline active.\n"
-            "- Output preset: AUTO(default, source->next target), HD(720p), FHD(1080p), QHD(1440p), 4K(2160p).\n"
-            "- AUTO mapping: <720->HD, <1080->FHD, <1440->QHD, >=1440->4K.\n"
-            "- Capture backend: gdi (default) or pil.\n"
-            f"- GPU Video Path: {'available' if CUDA_AVAILABLE else 'fallback to CPU'}.\n"
-            "- Capture is pipelined on a dedicated thread (latest-frame mode).\n"
-            f"- Capture frame buffer: ring={CAPTURE_FRAME_BUFFER_SIZE}, newest-frame consume.\n"
-            "- NPU compile: INT8 hint is forced on NPU path.\n"
-            "- Device policy: Device=GPU -> GPU only, Device=NPU -> NPU only.\n"
-            "- OV Internal Scale range: 0.50 ~ 2.00.\n"
-            "- GPU compile path uses 720p base cap (max 1280x720) before tiled SR infer.\n"
-            "- Reactive Scale: adjust OV internal scale automatically to chase target FPS.\n"
-            "- Auto SR model by output preset: HD/4K -> t256, FHD/QHD -> t192 (custom model path is respected).\n"
-            "- Temporal Restore: motion-compensated history blend to reduce flicker.\n"
-            "- Two-input OV model(input_curr,input_prev) runs temporal blend on NPU and skips CPU temporal step.\n"
-            "- FG default model: fixed_fg_algo_mid (algorithmic midpoint interpolation, no training).\n"
-            "- OV tile infer uses async request pool (NPU=auto max, GPU=optimal auto, CPU=2).\n"
-            "- Benchmark Log: write per-frame metrics to CSV while running.\n"
-            "- SR to Fullscreen: stretch SR output to monitor size.\n"
-            "- CPU fallback: disabled in current GUI profile.",
+            build_help_text(
+                cuda_available=CUDA_AVAILABLE,
+                capture_backends=SUPPORTED_CAPTURE_BACKENDS,
+                capture_frame_buffer_size=CAPTURE_FRAME_BUFFER_SIZE,
+            ),
         )
 
     def _sync_runtime_config(self):
@@ -3068,7 +3084,7 @@ class LunaRealtimeGui:
         if self.backend_var.get() != "openvino_sr":
             self.backend_var.set("openvino_sr")
         capture_backend = (self.capture_backend_var.get().strip().lower() or DEFAULT_CAPTURE_BACKEND)
-        if capture_backend not in ("gdi", "pil"):
+        if capture_backend not in SUPPORTED_CAPTURE_BACKENDS:
             capture_backend = DEFAULT_CAPTURE_BACKEND
         strict_npu_only = bool(self.strict_npu_only_var.get())
         strict_gpu_only = bool(self.strict_gpu_only_var.get())
@@ -3078,10 +3094,10 @@ class LunaRealtimeGui:
         if self.output_preset_var.get().strip().upper() != output_preset:
             self.output_preset_var.set(output_preset)
         frame_budget_ms = max(0.0, parse_float(self.frame_budget_var.get(), 100.0))
-        device = (self.device_var.get().strip() or "AUTO").upper()
-        if device not in ("AUTO", "NPU", "GPU", "CPU"):
-            device = "AUTO"
-            self.device_var.set("AUTO")
+        device = (self.device_var.get().strip() or "NPU").upper()
+        if device not in ("NPU", "GPU"):
+            device = "NPU"
+            self.device_var.set("NPU")
 
         # Enforce strict execution by selected device family.
         if device == "NPU":
@@ -3091,20 +3107,13 @@ class LunaRealtimeGui:
                 self.strict_npu_only_var.set(True)
             if self.strict_gpu_only_var.get():
                 self.strict_gpu_only_var.set(False)
-        elif device == "GPU":
+        else:
             strict_npu_only = False
             strict_gpu_only = True
             if self.strict_npu_only_var.get():
                 self.strict_npu_only_var.set(False)
             if not self.strict_gpu_only_var.get():
                 self.strict_gpu_only_var.set(True)
-        else:
-            strict_npu_only = False
-            strict_gpu_only = False
-            if self.strict_npu_only_var.get():
-                self.strict_npu_only_var.set(False)
-            if self.strict_gpu_only_var.get():
-                self.strict_gpu_only_var.set(False)
 
         if strict_npu_only:
             device = "NPU"
@@ -3133,6 +3142,24 @@ class LunaRealtimeGui:
         temporal_restore = bool(self.temporal_restore_var.get())
         temporal_strength = parse_float(self.temporal_strength_var.get(), DEFAULT_TEMPORAL_STRENGTH)
         temporal_strength = max(0.0, min(1.0, temporal_strength))
+
+        if strict_npu_only:
+            capture_backend = "dxgi"
+            if self.capture_backend_var.get().strip().lower() != "dxgi":
+                self.capture_backend_var.set("dxgi")
+            temporal_restore = False
+            if self.temporal_restore_var.get():
+                self.temporal_restore_var.set(False)
+            ov_reactive_scale = False
+            if self.ov_reactive_var.get():
+                self.ov_reactive_var.set(False)
+        elif strict_gpu_only:
+            capture_backend = "dxgi"
+            if self.capture_backend_var.get().strip().lower() != "dxgi":
+                self.capture_backend_var.set("dxgi")
+            temporal_restore = False
+            if self.temporal_restore_var.get():
+                self.temporal_restore_var.set(False)
         benchmark_enabled = bool(self.benchmark_var.get())
         benchmark_csv = (self.benchmark_csv_var.get() or "").strip() or DEFAULT_BENCHMARK_CSV
         ov_cache_dir = self.ov_cache_var.get().strip() or DEFAULT_OV_CACHE_DIR
@@ -3146,6 +3173,11 @@ class LunaRealtimeGui:
             self.overlay_click_var.set(True)
         overlay_exclude = bool(self.overlay_exclude_var.get())
         overlay_fullscreen = bool(self.overlay_fullscreen_var.get())
+        overlay_force_inplace = bool(self.overlay_inplace_var.get())
+        if strict_npu_only or strict_gpu_only:
+            overlay_exclude = True
+            if not self.overlay_exclude_var.get():
+                self.overlay_exclude_var.set(True)
         fg_enabled = bool(self.fg_var.get())
         fg_interp_only = bool(self.fg_interp_only_var.get())
         if LUNASR_ONLY_MODE:
@@ -3202,6 +3234,7 @@ class LunaRealtimeGui:
                 fg_precision=fg_precision,
                 fg_size=fg_size,
                 fg_timestep=fg_timestep,
+                overlay_force_inplace=overlay_force_inplace,
             )
 
     def start_worker(self):
@@ -3212,6 +3245,19 @@ class LunaRealtimeGui:
         if cfg.hwnd <= 0:
             messagebox.showerror("LunaSR GUI", "Select a valid target window.")
             return
+        if bool(cfg.strict_npu_only or cfg.strict_gpu_only):
+            if str(cfg.capture_backend).strip().lower() == "dxgi":
+                dx_ok, dx_note = capture_dxgi_status()
+                if not bool(dx_ok):
+                    messagebox.showerror(
+                        "LunaSR GUI",
+                        "DXGI capture backend is unavailable in this Python environment.\n\n"
+                        f"detail: {dx_note}\n"
+                        f"python: {sys.executable}\n\n"
+                        "Install a local dxcam wheel/package into this Python, then retry.\n"
+                        "Strict mode currently blocks CPU fallback, so capture cannot start without DXGI.",
+                    )
+                    return
         if cfg.backend == "openvino_sr":
             model_path = resolve_model_path(cfg.ov_model)
             if not model_path.exists():
@@ -3232,12 +3278,15 @@ class LunaRealtimeGui:
             user32.SetForegroundWindow(int(cfg.hwnd))
         except Exception:
             pass
+        self._set_target_controls_enabled(False)
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        self._update_tray_tip(running=True)
         fg_state = "on" if cfg.fg_enabled else "off"
         fg_mode = "interp_only" if cfg.fg_interp_only else "normal"
         self.status_main_var.set(
-            f"Worker running in overlay mode (fg={fg_state}, fg_mode={fg_mode}). Stop or Alt+P."
+            f"Worker running (target_hwnd={int(cfg.hwnd)} | fg={fg_state}/{fg_mode}). "
+            "Toggle: F8, Show/Hide GUI: F9, Stop: Alt+P."
         )
 
     def stop_worker(self, reason: Optional[str] = None):
@@ -3246,14 +3295,18 @@ class LunaRealtimeGui:
             self.worker.join(timeout=2.0)
             self.worker = None
         self.overlay_window.hide()
+        self._set_target_controls_enabled(True)
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        self._update_tray_tip(running=False)
         if reason:
             self.status_main_var.set(reason)
         else:
             self.status_main_var.set("Worker stopped.")
 
     def _poll_status_queue(self):
+        if self._shutting_down:
+            return
         latest: Optional[Dict[str, object]] = None
         while True:
             try:
@@ -3297,14 +3350,18 @@ class LunaRealtimeGui:
                     f"input={latest['input_shape']} | output={latest['output_shape']}"
                 )
             if "stopped" in latest:
+                self._set_target_controls_enabled(True)
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
+                self._update_tray_tip(running=False)
                 self.status_main_var.set("Worker stopped.")
             if "overlay_hide" in latest:
                 self.overlay_window.hide()
         self.root.after(STATUS_POLL_INTERVAL_MS, self._poll_status_queue)
 
     def _poll_overlay_queue(self):
+        if self._shutting_down:
+            return
         payload: Optional[Dict[str, object]] = None
         while True:
             try:
@@ -3336,9 +3393,17 @@ class LunaRealtimeGui:
         finally:
             self.root.after(OVERLAY_POLL_INTERVAL_MS, self._poll_overlay_queue)
 
-    def on_close(self):
+    def exit_app(self):
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._unregister_global_hotkeys()
+        self._remove_tray_icon()
         self.stop_worker()
         self.root.destroy()
+
+    def on_close(self):
+        self._hide_to_tray()
 
 
 def main() -> int:
@@ -3352,3 +3417,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

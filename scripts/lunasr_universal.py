@@ -423,22 +423,36 @@ def build_masks(y: np.ndarray, p: LunaParams) -> Tuple[np.ndarray, np.ndarray, n
     return grad, a, text, gamma_block
 
 
+def guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    r = max(1, int(radius))
+    k = (r * 2 + 1, r * 2 + 1)
+    e = max(1e-6, float(eps))
+
+    mean_i = cv2.boxFilter(guide, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_p = cv2.boxFilter(src, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_ip = cv2.boxFilter(guide * src, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    cov_ip = mean_ip - mean_i * mean_p
+
+    mean_ii = cv2.boxFilter(guide * guide, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    var_i = mean_ii - mean_i * mean_i
+
+    a = cov_ip / (var_i + e)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT101)
+    return mean_a * guide + mean_b
+
+
 def run_artifact_fix(y: np.ndarray, gamma_block: np.ndarray, p: LunaParams) -> np.ndarray:
-    y_work = y
+    y_work = clamp01(y.astype(np.float32))
     for pi in range(p.artifact_passes):
         pass_ratio = float(pi + 1) / float(max(1, p.artifact_passes))
-        color_sigma = float(np.clip(5.0 + p.alpha_base * (1.0 + 0.20 * pi), 10.0, 110.0))
-        space_sigma = float(np.clip(1.0 + p.beta_base * (1.0 + 0.15 * pi), 1.0, 12.0))
-        d_size = 5 if pi == 0 else 7
-
-        y_u8 = np.clip(y_work * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        y_bilateral = (
-            cv2.bilateralFilter(y_u8, d=d_size, sigmaColor=color_sigma, sigmaSpace=space_sigma).astype(np.float32)
-            / 255.0
-        )
-
+        radius = int(np.clip(round(1.5 + p.beta_base * (1.0 + 0.20 * pi)), 1, 16))
+        eps = float(np.clip((0.0012 + p.alpha_base * 0.00005) * (1.0 + 0.25 * pi), 1e-5, 0.08))
+        y_guided = guided_filter_gray(y_work, y_work, radius=radius, eps=eps)
         mix = clamp01(gamma_block * (0.55 + 0.35 * pass_ratio) * p.deblock_softness)
-        y_work = (1.0 - mix) * y_work + mix * y_bilateral
+        y_work = (1.0 - mix) * y_work + mix * y_guided
+        y_work = clamp01(y_work)
     return y_work
 
 

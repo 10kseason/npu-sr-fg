@@ -57,6 +57,46 @@ def bgr_to_nchw01(bgr: np.ndarray) -> np.ndarray:
     return x
 
 
+def element_type_to_numpy_dtype(etype) -> np.dtype:
+    token = str(etype).lower()
+    if "f16" in token or "bf16" in token:
+        return np.float16
+    if "f32" in token or "float" in token:
+        return np.float32
+    if "f64" in token:
+        return np.float64
+    if "i64" in token:
+        return np.int64
+    if "i32" in token:
+        return np.int32
+    if "i16" in token:
+        return np.int16
+    if "i8" in token:
+        return np.int8
+    if "u8" in token:
+        return np.uint8
+    if "bool" in token:
+        return np.bool_
+    return np.float32
+
+
+def bgr_to_nchw01_for_input(bgr: np.ndarray, in_c: int, in_h: int, in_w: int, dtype) -> np.ndarray:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if rgb.shape[0] != in_h or rgb.shape[1] != in_w:
+        rgb = cv2.resize(rgb, (in_w, in_h), interpolation=cv2.INTER_AREA)
+    if in_c == 1:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[:, :, None]
+    elif in_c == 4:
+        a = np.full((in_h, in_w, 1), 255, dtype=np.uint8)
+        rgb = np.concatenate([rgb, a], axis=2)
+    x = np.transpose(rgb, (2, 0, 1))[None].astype(np.float32) / 255.0
+    if np.issubdtype(dtype, np.floating):
+        return x.astype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        return np.clip(x * 255.0 + 0.5, 0.0, 255.0).astype(dtype)
+    return x.astype(np.float32)
+
+
 def nchw01_to_bgr(x: np.ndarray) -> np.ndarray:
     if x.ndim == 4:
         x = x[0]
@@ -397,11 +437,34 @@ def _lazy_ov_nncf():
         import openvino as ov
     except Exception as e:
         raise RuntimeError("OpenVINO is required.") from e
+    nncf_err: Optional[Exception] = None
     try:
         import nncf
+        if hasattr(nncf, "quantize") and hasattr(nncf, "Dataset"):
+            return ov, nncf
+        nncf_err = RuntimeError("Imported nncf is not a full package (likely namespace shadow).")
     except Exception as e:
-        raise RuntimeError("NNCF is required for INT8 PTQ. install nncf.") from e
-    return ov, nncf
+        nncf_err = e
+
+    local_src = PROJECT_DIR / "nncf" / "nncf-2.19.0" / "src"
+    if local_src.exists():
+        if str(local_src) not in sys.path:
+            sys.path.insert(0, str(local_src))
+        try:
+            if "nncf" in sys.modules:
+                del sys.modules["nncf"]
+            import nncf
+            if hasattr(nncf, "quantize") and hasattr(nncf, "Dataset"):
+                return ov, nncf
+            nncf_err = RuntimeError("Local nncf source loaded but API is incomplete.")
+        except Exception as e:
+            nncf_err = e
+
+    detail = str(nncf_err) if nncf_err is not None else "unknown"
+    raise RuntimeError(
+        f"NNCF is required for INT8 PTQ. install nncf dependencies or provide a complete wheel. "
+        f"local_src={local_src} error={detail}"
+    )
 
 
 def _make_calibration_samples(
@@ -416,16 +479,8 @@ def _make_calibration_samples(
         img = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if img is None:
             continue
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        if rgb.shape[0] != in_h or rgb.shape[1] != in_w:
-            rgb = cv2.resize(rgb, (in_w, in_h), interpolation=cv2.INTER_AREA)
-        if in_c == 1:
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[:, :, None]
-        elif in_c == 4:
-            a = np.full((in_h, in_w, 1), 255, dtype=np.uint8)
-            rgb = np.concatenate([rgb, a], axis=2)
-        x = np.transpose(rgb, (2, 0, 1))[None].astype(np.float32) / 255.0
-        out.append(x)
+        x = bgr_to_nchw01_for_input(img, in_c=in_c, in_h=in_h, in_w=in_w, dtype=np.float32)
+        out.append(x.astype(np.float32))
         if 0 < limit <= len(out):
             break
     return out
@@ -438,29 +493,71 @@ def run_ptq_int8(args) -> int:
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     model = ov.Core().read_model(str(model_path))
-    if len(model.inputs) != 1:
-        raise RuntimeError("PTQ script expects single-input model.")
+    input_meta: List[Dict[str, object]] = []
+    image_input_count = 0
+    for inp in model.inputs:
+        name = str(inp.any_name)
+        shape = [int(x) for x in inp.shape]
+        dtype = element_type_to_numpy_dtype(inp.element_type)
+        kind = "other"
+        if len(shape) == 4 and shape[0] == 1 and shape[1] in (1, 3, 4):
+            kind = "image"
+            image_input_count += 1
+        elif int(np.prod(shape)) == 1 and "timestep" in name.lower():
+            kind = "timestep"
 
-    in_shape = [int(x) for x in model.inputs[0].shape]
-    if len(in_shape) != 4:
-        raise RuntimeError(f"Expected 4D NCHW input. got {in_shape}")
-    n, c, h, w = in_shape
-    if n != 1 or c not in (1, 3, 4):
-        raise RuntimeError(f"Unsupported model input shape: {in_shape}")
-    in_name = model.inputs[0].any_name
+        input_meta.append(
+            {
+                "name": name,
+                "shape": shape,
+                "dtype": dtype,
+                "kind": kind,
+            }
+        )
+
+    if image_input_count < 1:
+        raise RuntimeError("PTQ requires at least one image-like 4D NCHW input.")
 
     calib_dir = Path(args.calib_dir)
     imgs = list_images(calib_dir)
     if not imgs:
         raise RuntimeError(f"No calibration images found: {calib_dir}")
-    samples = _make_calibration_samples(imgs, in_c=c, in_h=h, in_w=w, limit=int(args.calib_size))
-    if not samples:
+    raw_samples: List[np.ndarray] = []
+    limit = int(args.calib_size)
+    for p in imgs:
+        bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        raw_samples.append(bgr)
+        if 0 < limit <= len(raw_samples):
+            break
+    if not raw_samples:
         raise RuntimeError("No usable calibration samples.")
 
-    def transform_fn(sample):
-        return {in_name: sample}
+    def transform_fn(sample_bgr: np.ndarray):
+        feed: Dict[str, np.ndarray] = {}
+        for meta in input_meta:
+            name = str(meta["name"])
+            shape = [int(x) for x in meta["shape"]]
+            dtype = meta["dtype"]
+            kind = str(meta["kind"])
 
-    dataset = nncf.Dataset(samples, transform_fn)
+            if kind == "image":
+                _, c, h, w = shape
+                feed[name] = bgr_to_nchw01_for_input(
+                    sample_bgr,
+                    in_c=int(c),
+                    in_h=int(h),
+                    in_w=int(w),
+                    dtype=dtype,
+                )
+            elif kind == "timestep":
+                feed[name] = np.full(shape, np.float32(0.5), dtype=dtype)
+            else:
+                feed[name] = np.zeros(shape, dtype=dtype)
+        return feed
+
+    dataset = nncf.Dataset(raw_samples, transform_fn)
     preset = nncf.QuantizationPreset.PERFORMANCE if args.preset == "performance" else nncf.QuantizationPreset.MIXED
 
     t0 = time.perf_counter()
@@ -472,8 +569,102 @@ def run_ptq_int8(args) -> int:
     ov.save_model(q_model, str(out_xml))
 
     print(f"saved_int8_ir={out_xml}")
-    print(f"calibration_samples={len(samples)}")
+    print(f"input_count={len(input_meta)}, image_input_count={image_input_count}")
+    print(f"calibration_samples={len(raw_samples)}")
     print(f"quantize_ms={(t1 - t0) * 1000.0:.1f}")
+    return 0
+
+
+def run_offline_int8(args) -> int:
+    try:
+        import openvino as ov
+        import openvino._offline_transformations as ot
+    except Exception as e:
+        raise RuntimeError("OpenVINO with offline transformations is required.") from e
+
+    model_path = Path(args.model)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    out_xml = Path(args.output_xml)
+    out_xml.parent.mkdir(parents=True, exist_ok=True)
+
+    core = ov.Core()
+    model = core.read_model(str(model_path))
+
+    t0 = time.perf_counter()
+    ot.compress_quantize_weights_transformation(model)
+    if bool(args.compress_model):
+        ot.compress_model_transformation(model)
+    t1 = time.perf_counter()
+
+    ov.save_model(model, str(out_xml))
+    print(f"saved_offline_int8_ir={out_xml}")
+    print(f"offline_transform_ms={(t1 - t0) * 1000.0:.1f}")
+
+    src_bin = model_path.with_suffix(".bin")
+    out_bin = out_xml.with_suffix(".bin")
+    if src_bin.exists() and out_bin.exists():
+        print(f"bin_size_before={src_bin.stat().st_size}")
+        print(f"bin_size_after={out_bin.stat().st_size}")
+
+    if not bool(args.smoke):
+        return 0
+
+    compiled = core.compile_model(model, args.device)
+    req = compiled.create_infer_request()
+    feed: Dict[str, np.ndarray] = {}
+
+    image_for_smoke = None
+    if args.image:
+        image_for_smoke = cv2.imread(str(Path(args.image)), cv2.IMREAD_COLOR)
+        if image_for_smoke is None:
+            raise RuntimeError(f"Failed to read smoke image: {args.image}")
+
+    for inp in compiled.inputs:
+        name = str(inp.any_name)
+        shape = [int(x) for x in inp.shape]
+        dtype = element_type_to_numpy_dtype(inp.element_type)
+        lname = name.lower()
+        if len(shape) == 4 and shape[0] == 1 and shape[1] in (1, 3, 4):
+            _, c, h, w = shape
+            if image_for_smoke is None:
+                bgr = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
+            else:
+                bgr = image_for_smoke
+            feed[name] = bgr_to_nchw01_for_input(
+                bgr,
+                in_c=int(c),
+                in_h=int(h),
+                in_w=int(w),
+                dtype=dtype,
+            )
+        elif int(np.prod(shape)) == 1 and "timestep" in lname:
+            feed[name] = np.full(shape, np.float32(0.5), dtype=dtype)
+        else:
+            feed[name] = np.zeros(shape, dtype=dtype)
+
+    t2 = time.perf_counter()
+    outputs = req.infer(feed)
+    t3 = time.perf_counter()
+
+    exec_devices = "unknown"
+    try:
+        v = compiled.get_property("EXECUTION_DEVICES")
+        if isinstance(v, (list, tuple)):
+            exec_devices = ",".join(str(x) for x in v)
+        else:
+            exec_devices = str(v)
+    except Exception:
+        pass
+
+    out_name = str(compiled.outputs[0].any_name)
+    y = outputs[out_name] if out_name in outputs else next(iter(outputs.values()))
+    y_np = np.asarray(y)
+    print(f"smoke_device={args.device}")
+    print(f"smoke_exec_devices={exec_devices}")
+    print(f"smoke_infer_ms={(t3 - t2) * 1000.0:.3f}")
+    print(f"smoke_output_shape={tuple(int(x) for x in y_np.shape)}")
     return 0
 
 
@@ -572,6 +763,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_q.add_argument("--preset", choices=["performance", "mixed"], default="performance")
     p_q.add_argument("--output-xml", required=True)
 
+    p_oq = sub.add_parser(
+        "int8-offline",
+        help="Run OpenVINO offline weight INT8 compression (no NNCF dependency).",
+    )
+    p_oq.add_argument("--model", required=True, help="Input OpenVINO IR XML")
+    p_oq.add_argument("--output-xml", required=True)
+    p_oq.add_argument("--compress-model", action="store_true", help="Also apply generic model compression pass.")
+    p_oq.add_argument("--smoke", action="store_true", help="Compile/infer once after conversion.")
+    p_oq.add_argument("--device", default="NPU")
+    p_oq.add_argument("--image", default="", help="Optional image path for smoke input.")
+
     p_sm = sub.add_parser("smoke-npu", help="Compile/infer once and print execution devices.")
     p_sm.add_argument("--model-xml", required=True)
     p_sm.add_argument("--image", required=True)
@@ -591,6 +793,8 @@ def main() -> int:
         return run_export_onnx(args)
     if args.cmd == "ptq-int8":
         return run_ptq_int8(args)
+    if args.cmd == "int8-offline":
+        return run_offline_int8(args)
     if args.cmd == "smoke-npu":
         return run_smoke_npu(args)
     raise RuntimeError(f"Unknown command: {args.cmd}")

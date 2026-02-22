@@ -19,6 +19,8 @@ def resolve_temporal_preset(name: str) -> Dict[str, float]:
             "temporal_hf_gain": 1.05,
             "temporal_detail_boost": 0.12,
             "temporal_detail_threshold": 0.05,
+            "temporal_occlusion_strength": 0.55,
+            "temporal_occlusion_threshold": 0.06,
         },
         # Sharper details with lower history dependency.
         "crisp": {
@@ -27,6 +29,8 @@ def resolve_temporal_preset(name: str) -> Dict[str, float]:
             "temporal_hf_gain": 1.14,
             "temporal_detail_boost": 0.20,
             "temporal_detail_threshold": 0.04,
+            "temporal_occlusion_strength": 0.72,
+            "temporal_occlusion_threshold": 0.05,
         },
         # More stable temporal blend with conservative edge boost.
         "stable": {
@@ -35,6 +39,8 @@ def resolve_temporal_preset(name: str) -> Dict[str, float]:
             "temporal_hf_gain": 0.98,
             "temporal_detail_boost": 0.07,
             "temporal_detail_threshold": 0.06,
+            "temporal_occlusion_strength": 0.48,
+            "temporal_occlusion_threshold": 0.07,
         },
     }
     if n in table:
@@ -99,6 +105,51 @@ def _depthwise_kernel_3x3_gaussian(channels: int = 3) -> np.ndarray:
         dtype=np.float32,
     )
     k = k / np.sum(k)
+    w = np.zeros((channels, 1, 1, 3, 3), dtype=np.float32)
+    for c in range(channels):
+        w[c, 0, 0, :, :] = k
+    return w
+
+
+def _depthwise_kernel_3x3_laplacian(channels: int = 3) -> np.ndarray:
+    k = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, -4.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    w = np.zeros((channels, 1, 1, 3, 3), dtype=np.float32)
+    for c in range(channels):
+        w[c, 0, 0, :, :] = k
+    return w
+
+
+def _depthwise_kernel_3x3_sobel_x(channels: int = 3) -> np.ndarray:
+    k = np.array(
+        [
+            [-1.0, 0.0, 1.0],
+            [-2.0, 0.0, 2.0],
+            [-1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ) / np.float32(8.0)
+    w = np.zeros((channels, 1, 1, 3, 3), dtype=np.float32)
+    for c in range(channels):
+        w[c, 0, 0, :, :] = k
+    return w
+
+
+def _depthwise_kernel_3x3_sobel_y(channels: int = 3) -> np.ndarray:
+    k = np.array(
+        [
+            [-1.0, -2.0, -1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    ) / np.float32(8.0)
     w = np.zeros((channels, 1, 1, 3, 3), dtype=np.float32)
     for c in range(channels):
         w[c, 0, 0, :, :] = k
@@ -221,6 +272,16 @@ def build_fixed_sr_model(
     temporal_hf_gain: float = 1.0,
     temporal_detail_boost: float = 0.0,
     temporal_detail_threshold: float = 0.05,
+    temporal_occlusion_strength: float = 0.55,
+    temporal_occlusion_threshold: float = 0.06,
+    hybrid_flat_threshold: float = 0.022,
+    hybrid_edge_threshold: float = 0.085,
+    fed_step: float = 0.14,
+    fed_kappa: float = 0.09,
+    halo_guard_strength: float = 0.72,
+    halo_risk_scale: float = 0.06,
+    halo_edge_threshold: float = 0.08,
+    halo_min_gain_ratio: float = 0.30,
 ) -> ov.Model:
     ops = ov.opset10
     out_h = int(in_h * upscale)
@@ -243,6 +304,10 @@ def build_fixed_sr_model(
 
     out_shape = ops.constant(np.array([1, 3, out_h, out_w], dtype=np.int64))
     scales = ops.constant(np.array([1.0, 1.0, float(upscale), float(upscale)], dtype=np.float32))
+    ch_axis = ops.constant(np.array([1], dtype=np.int64))
+    one = ops.constant(np.float32(1.0))
+    eps = ops.constant(np.float32(1e-6))
+
     up_curr = ops.interpolate(
         image=x_curr01,
         output_shape=out_shape,
@@ -254,31 +319,195 @@ def build_fixed_sr_model(
         antialias=False,
     )
 
-    k = ops.constant(_depthwise_kernel_3x3_gaussian(3))
-    blur0 = ops.group_convolution(
-        data=up_curr,
-        filters=k,
-        strides=[1, 1],
-        pads_begin=[1, 1],
-        pads_end=[1, 1],
-        dilations=[1, 1],
-    )
+    k_gauss = ops.constant(_depthwise_kernel_3x3_gaussian(3))
+    k_lap = ops.constant(_depthwise_kernel_3x3_laplacian(3))
+    k_sobel_x = ops.constant(_depthwise_kernel_3x3_sobel_x(3))
+    k_sobel_y = ops.constant(_depthwise_kernel_3x3_sobel_y(3))
 
-    detail = ops.subtract(up_curr, blur0)
-    sharpened = ops.add(up_curr, ops.multiply(detail, ops.constant(np.float32(sharpen_gain))))
+    flat_th = max(1e-4, min(0.80, float(hybrid_flat_threshold)))
+    edge_th = max(flat_th + 1e-4, min(0.99, float(hybrid_edge_threshold)))
+    fed_step_v = max(0.0, min(0.24, float(fed_step)))
+    fed_kappa_v = max(1e-4, float(fed_kappa))
+    fed_inv_k2 = np.float32(1.0 / max(1e-6, fed_kappa_v * fed_kappa_v))
+
+    def _blur(x):
+        return ops.group_convolution(
+            data=x,
+            filters=k_gauss,
+            strides=[1, 1],
+            pads_begin=[1, 1],
+            pads_end=[1, 1],
+            dilations=[1, 1],
+        )
+
+    def _mean_abs(x):
+        return ops.reduce_mean(
+            ops.abs(x),
+            ch_axis,
+            True,
+        )
+
+    def _hybrid_low_high(up_x):
+        blur1 = _blur(up_x)
+        blur2 = _blur(blur1)
+        hi0 = ops.subtract(up_x, blur1)
+        hi0_mag = _mean_abs(hi0)
+
+        flat_mask = ops.clamp(
+            ops.multiply(
+                ops.subtract(ops.constant(np.float32(flat_th)), hi0_mag),
+                ops.constant(np.float32(1.0 / max(1e-6, flat_th))),
+            ),
+            0.0,
+            1.0,
+        )
+        edge_mask = ops.clamp(
+            ops.multiply(
+                ops.subtract(hi0_mag, ops.constant(np.float32(edge_th))),
+                ops.constant(np.float32(1.0 / max(1e-6, 1.0 - edge_th))),
+            ),
+            0.0,
+            1.0,
+        )
+        tex_mask = ops.clamp(
+            ops.subtract(ops.subtract(one, flat_mask), edge_mask),
+            0.0,
+            1.0,
+        )
+
+        mask_sum = ops.add(ops.add(flat_mask, tex_mask), ops.add(edge_mask, eps))
+        flat_w = ops.divide(flat_mask, mask_sum)
+        tex_w = ops.divide(tex_mask, mask_sum)
+        edge_w = ops.divide(edge_mask, mask_sum)
+
+        gx = ops.group_convolution(
+            data=up_x,
+            filters=k_sobel_x,
+            strides=[1, 1],
+            pads_begin=[1, 1],
+            pads_end=[1, 1],
+            dilations=[1, 1],
+        )
+        gy = ops.group_convolution(
+            data=up_x,
+            filters=k_sobel_y,
+            strides=[1, 1],
+            pads_begin=[1, 1],
+            pads_end=[1, 1],
+            dilations=[1, 1],
+        )
+        grad_sq = ops.add(ops.multiply(gx, gx), ops.multiply(gy, gy))
+        conductance = ops.exp(
+            ops.multiply(
+                ops.constant(np.float32(-fed_inv_k2)),
+                grad_sq,
+            )
+        )
+        lap = ops.group_convolution(
+            data=up_x,
+            filters=k_lap,
+            strides=[1, 1],
+            pads_begin=[1, 1],
+            pads_end=[1, 1],
+            dilations=[1, 1],
+        )
+        fed = ops.clamp(
+            ops.add(
+                up_x,
+                ops.multiply(
+                    ops.constant(np.float32(fed_step_v)),
+                    ops.multiply(conductance, lap),
+                ),
+            ),
+            0.0,
+            1.0,
+        )
+
+        low = ops.add(
+            ops.add(
+                ops.multiply(flat_w, blur2),
+                ops.multiply(tex_w, fed),
+            ),
+            ops.multiply(edge_w, blur1),
+        )
+        high = ops.subtract(up_x, low)
+        high_mag = _mean_abs(high)
+        return low, high, high_mag
+
+    low_curr, high_curr, high_mag_curr = _hybrid_low_high(up_curr)
+
+    # Halo guard: reduce sharpening gain where detail boost likely causes overshoot/undershoot.
+    sh_gain = max(0.0, float(sharpen_gain))
+    halo_guard = max(0.0, min(1.0, float(halo_guard_strength)))
+    halo_scale = max(1e-4, float(halo_risk_scale))
+    halo_edge_th = max(0.0, min(0.99, float(halo_edge_threshold)))
+    halo_min_ratio = max(0.0, min(1.0, float(halo_min_gain_ratio)))
+    edge_conf_sharp = ops.clamp(
+        ops.multiply(
+            ops.subtract(high_mag_curr, ops.constant(np.float32(halo_edge_th))),
+            ops.constant(np.float32(1.0 / max(1e-6, 1.0 - halo_edge_th))),
+        ),
+        0.0,
+        1.0,
+    )
+    high_pos = ops.relu(high_curr)
+    high_neg = ops.relu(ops.negative(high_curr))
+    headroom_pos = ops.subtract(one, up_curr)
+    headroom_neg = up_curr
+    risk_pos = ops.relu(
+        ops.subtract(
+            ops.multiply(high_pos, ops.constant(np.float32(sh_gain))),
+            headroom_pos,
+        )
+    )
+    risk_neg = ops.relu(
+        ops.subtract(
+            ops.multiply(high_neg, ops.constant(np.float32(sh_gain))),
+            headroom_neg,
+        )
+    )
+    halo_risk = ops.reduce_mean(
+        ops.add(risk_pos, risk_neg),
+        ch_axis,
+        True,
+    )
+    halo_risk01 = ops.clamp(
+        ops.multiply(halo_risk, ops.constant(np.float32(1.0 / halo_scale))),
+        0.0,
+        1.0,
+    )
+    gain_gate = ops.clamp(
+        ops.subtract(
+            one,
+            ops.multiply(
+                ops.constant(np.float32(halo_guard)),
+                ops.multiply(edge_conf_sharp, halo_risk01),
+            ),
+        ),
+        0.0,
+        1.0,
+    )
+    sh_floor = sh_gain * halo_min_ratio
+    sh_span = max(0.0, sh_gain - sh_floor)
+    sharpen_gain_map = ops.add(
+        ops.constant(np.float32(sh_floor)),
+        ops.multiply(ops.constant(np.float32(sh_span)), gain_gate),
+    )
+    sharpened = ops.add(up_curr, ops.multiply(high_curr, sharpen_gain_map))
 
     y_pre = sharpened
     if temporal_model and temporal_prev_inputs:
-        # Temporal-plus algorithm:
-        # 1) blend only low-frequency component from previous frames
-        # 2) keep current high-frequency branch to preserve detail at low internal scale
-        # 3) confidence-gated weights to avoid ghosting on motion/disocclusion
-        low_curr = blur0
-        high_curr = detail
+        # Temporal v2:
+        # - motion confidence + occlusion gate on each history input
+        # - low-frequency temporal blend with current HF preserve
         weighted_low = low_curr
         weighted_sum = ops.constant(np.float32(1.0))
         base_gain = max(0.0, min(1.0, float(temporal_gain)))
         base_th = max(1e-6, float(temporal_diff_threshold))
+        occ_strength = max(0.0, min(1.0, float(temporal_occlusion_strength)))
+        occ_th = max(0.0, min(0.99, float(temporal_occlusion_threshold)))
+        occ_inv_span = 1.0 / max(1e-6, 1.0 - occ_th)
+        lum_curr = ops.reduce_mean(low_curr, ch_axis, True)
         for idx, (_name, prev01) in enumerate(temporal_prev_inputs, start=1):
             up_prev = ops.interpolate(
                 image=prev01,
@@ -300,7 +529,7 @@ def build_fixed_sr_model(
                 ops.constant(np.array([1], dtype=np.int64)),
                 True,
             )
-            conf_i = ops.clamp(
+            conf_motion = ops.clamp(
                 ops.multiply(
                     ops.subtract(ops.constant(np.float32(th_i)), diff_mean),
                     ops.constant(np.float32(inv_th)),
@@ -308,15 +537,40 @@ def build_fixed_sr_model(
                 0.0,
                 1.0,
             )
-            w_i = ops.multiply(conf_i, ops.constant(np.float32(gain_i)))
-            low_prev = ops.group_convolution(
-                data=up_prev,
-                filters=k,
-                strides=[1, 1],
-                pads_begin=[1, 1],
-                pads_end=[1, 1],
-                dilations=[1, 1],
+            low_prev, high_prev, high_mag_prev = _hybrid_low_high(up_prev)
+            lum_prev = ops.reduce_mean(low_prev, ch_axis, True)
+            occ_luma = ops.clamp(
+                ops.multiply(
+                    ops.subtract(ops.abs(ops.subtract(lum_curr, lum_prev)), ops.constant(np.float32(occ_th))),
+                    ops.constant(np.float32(occ_inv_span)),
+                ),
+                0.0,
+                1.0,
             )
+            occ_detail = ops.clamp(
+                ops.multiply(
+                    ops.relu(
+                        ops.subtract(
+                            ops.subtract(high_mag_curr, high_mag_prev),
+                            ops.constant(np.float32(occ_th)),
+                        )
+                    ),
+                    ops.constant(np.float32(occ_inv_span)),
+                ),
+                0.0,
+                1.0,
+            )
+            occ_mask = ops.maximum(occ_luma, occ_detail)
+            conf_occ = ops.clamp(
+                ops.subtract(
+                    one,
+                    ops.multiply(occ_mask, ops.constant(np.float32(occ_strength))),
+                ),
+                0.0,
+                1.0,
+            )
+            conf_i = ops.multiply(conf_motion, conf_occ)
+            w_i = ops.multiply(conf_i, ops.constant(np.float32(gain_i)))
             weighted_low = ops.add(weighted_low, ops.multiply(low_prev, w_i))
             weighted_sum = ops.add(weighted_sum, w_i)
 
@@ -329,7 +583,7 @@ def build_fixed_sr_model(
             high_abs = ops.abs(high_curr)
             high_mag = ops.reduce_mean(
                 high_abs,
-                ops.constant(np.array([1], dtype=np.int64)),
+                ch_axis,
                 True,
             )
             inv_th = 1.0 / max(1e-6, 1.0 - detail_th)
@@ -351,14 +605,7 @@ def build_fixed_sr_model(
         y_pre = ops.add(low_blend, hf_term)
         y_pre = ops.clamp(y_pre, 0.0, 1.0)
 
-    blur1 = ops.group_convolution(
-        data=y_pre,
-        filters=k,
-        strides=[1, 1],
-        pads_begin=[1, 1],
-        pads_end=[1, 1],
-        dilations=[1, 1],
-    )
+    blur1 = _blur(y_pre)
 
     # Blend sharpened and smoothed output: preserve_gain=1 keeps detail, 0 keeps smooth.
     mix_a = ops.multiply(y_pre, ops.constant(np.float32(preserve_gain)))
@@ -432,8 +679,18 @@ def run(args) -> int:
         temporal_hf_gain = 0.0
         temporal_detail_boost = 0.0
         temporal_detail_threshold = 0.0
+        temporal_occlusion_strength = 0.0
+        temporal_occlusion_threshold = 0.0
         sharpen_gain = 0.0
         preserve_gain = 1.0
+        hybrid_flat_threshold = 0.0
+        hybrid_edge_threshold = 0.0
+        fed_step = 0.0
+        fed_kappa = 0.0
+        halo_guard_strength = 0.0
+        halo_risk_scale = 0.0
+        halo_edge_threshold = 0.0
+        halo_min_gain_ratio = 0.0
     else:
         upscale = max(1, int(args.upscale))
         sharpen_gain = float(args.sharpen_gain)
@@ -446,6 +703,17 @@ def run(args) -> int:
         temporal_hf_gain = max(0.0, float(args.temporal_hf_gain))
         temporal_detail_boost = max(0.0, float(args.temporal_detail_boost))
         temporal_detail_threshold = max(0.0, min(0.99, float(args.temporal_detail_threshold)))
+        temporal_occlusion_strength = max(0.0, min(1.0, float(args.temporal_occlusion_strength)))
+        temporal_occlusion_threshold = max(0.0, min(0.99, float(args.temporal_occlusion_threshold)))
+        hybrid_flat_threshold = max(0.0, min(0.95, float(args.hybrid_flat_threshold)))
+        hybrid_edge_threshold = max(0.0, min(0.99, float(args.hybrid_edge_threshold)))
+        fed_step = max(0.0, min(0.24, float(args.fed_step)))
+        fed_kappa = max(1e-4, float(args.fed_kappa))
+        halo_guard_strength = max(0.0, min(1.0, float(args.halo_guard_strength)))
+        halo_risk_scale = max(1e-4, float(args.halo_risk_scale))
+        halo_edge_threshold = max(0.0, min(0.99, float(args.halo_edge_threshold))
+        )
+        halo_min_gain_ratio = max(0.0, min(1.0, float(args.halo_min_gain_ratio)))
         temporal_preset = str(args.temporal_preset).strip().lower()
         if temporal_model and temporal_preset != "custom":
             preset_vals = resolve_temporal_preset(temporal_preset)
@@ -459,6 +727,10 @@ def run(args) -> int:
             temporal_hf_gain = float(preset_vals["temporal_hf_gain"])
             temporal_detail_boost = float(preset_vals["temporal_detail_boost"])
             temporal_detail_threshold = float(preset_vals["temporal_detail_threshold"])
+            temporal_occlusion_strength = float(preset_vals.get("temporal_occlusion_strength", temporal_occlusion_strength))
+            temporal_occlusion_threshold = float(
+                preset_vals.get("temporal_occlusion_threshold", temporal_occlusion_threshold)
+            )
 
         model = build_fixed_sr_model(
             in_h=in_h,
@@ -473,6 +745,16 @@ def run(args) -> int:
             temporal_hf_gain=temporal_hf_gain,
             temporal_detail_boost=temporal_detail_boost,
             temporal_detail_threshold=temporal_detail_threshold,
+            temporal_occlusion_strength=temporal_occlusion_strength,
+            temporal_occlusion_threshold=temporal_occlusion_threshold,
+            hybrid_flat_threshold=hybrid_flat_threshold,
+            hybrid_edge_threshold=hybrid_edge_threshold,
+            fed_step=fed_step,
+            fed_kappa=fed_kappa,
+            halo_guard_strength=halo_guard_strength,
+            halo_risk_scale=halo_risk_scale,
+            halo_edge_threshold=halo_edge_threshold,
+            halo_min_gain_ratio=halo_min_gain_ratio,
         )
 
     out_xml = Path(args.output_xml)
@@ -495,9 +777,9 @@ def run(args) -> int:
     if model_type == "fg_mid":
         algo = "fg_mid(blend+detail_mix+motion_gate+motion_smooth)"
     else:
-        algo = "interpolate+depthwise_gaussian+unsharp+blend"
+        algo = "interpolate+hybrid_edge_preserve(FED+region_mix)+halo_guard+blend"
         if temporal_model:
-            algo += "+temporal_plus(lowfreq_accum+hf_preserve)"
+            algo += "+temporal_v2(lowfreq_accum+hf_preserve+occlusion_gate)"
             if temporal_detail_boost > 1e-6:
                 algo += "+edge_aware_hf_gain"
     print(f"algo={algo}")
@@ -508,13 +790,24 @@ def run(args) -> int:
         )
     else:
         print(f"sharpen_gain={sharpen_gain:.3f}, preserve_gain={preserve_gain:.3f}")
+        print(
+            f"hybrid_flat_threshold={hybrid_flat_threshold:.4f}, "
+            f"hybrid_edge_threshold={hybrid_edge_threshold:.4f}, "
+            f"fed_step={fed_step:.4f}, fed_kappa={fed_kappa:.4f}"
+        )
+        print(
+            f"halo_guard_strength={halo_guard_strength:.3f}, halo_risk_scale={halo_risk_scale:.4f}, "
+            f"halo_edge_threshold={halo_edge_threshold:.4f}, halo_min_gain_ratio={halo_min_gain_ratio:.3f}"
+        )
     if model_type == "sr_x2" and temporal_model:
         print(f"temporal_preset={temporal_preset}")
         print(
             f"temporal_depth={temporal_depth}, temporal_gain={temporal_gain:.3f}, "
             f"temporal_diff_threshold={temporal_diff_threshold:.4f}, temporal_hf_gain={temporal_hf_gain:.3f}, "
             f"temporal_detail_boost={temporal_detail_boost:.3f}, "
-            f"temporal_detail_threshold={temporal_detail_threshold:.3f}"
+            f"temporal_detail_threshold={temporal_detail_threshold:.3f}, "
+            f"temporal_occlusion_strength={temporal_occlusion_strength:.3f}, "
+            f"temporal_occlusion_threshold={temporal_occlusion_threshold:.3f}"
         )
 
     if not args.smoke:
@@ -602,6 +895,54 @@ def main() -> int:
     parser.add_argument("--upscale", type=int, default=2, help="Upscale factor.")
     parser.add_argument("--sharpen-gain", type=float, default=0.67, help="Unsharp detail gain.")
     parser.add_argument("--preserve-gain", type=float, default=0.90, help="Blend ratio between sharpened/smoothed.")
+    parser.add_argument(
+        "--hybrid-flat-threshold",
+        type=float,
+        default=0.022,
+        help="Hybrid filter flat-region threshold (low HF magnitude => stronger smoothing).",
+    )
+    parser.add_argument(
+        "--hybrid-edge-threshold",
+        type=float,
+        default=0.085,
+        help="Hybrid filter edge threshold (high HF magnitude => edge-preserving branch).",
+    )
+    parser.add_argument(
+        "--fed-step",
+        type=float,
+        default=0.14,
+        help="Fast Explicit Diffusion step size (0~0.24).",
+    )
+    parser.add_argument(
+        "--fed-kappa",
+        type=float,
+        default=0.09,
+        help="Fast Explicit Diffusion edge sensitivity.",
+    )
+    parser.add_argument(
+        "--halo-guard-strength",
+        type=float,
+        default=0.72,
+        help="Halo guard gain reduction strength (0~1).",
+    )
+    parser.add_argument(
+        "--halo-risk-scale",
+        type=float,
+        default=0.06,
+        help="Halo risk normalization scale.",
+    )
+    parser.add_argument(
+        "--halo-edge-threshold",
+        type=float,
+        default=0.08,
+        help="Edge threshold used by halo guard map.",
+    )
+    parser.add_argument(
+        "--halo-min-gain-ratio",
+        type=float,
+        default=0.30,
+        help="Minimum sharpen gain ratio under halo guard.",
+    )
     parser.add_argument("--temporal-model", action="store_true", help="Build temporal-plus multi-input model.")
     parser.add_argument(
         "--temporal-preset",
@@ -624,6 +965,18 @@ def main() -> int:
         type=float,
         default=0.08,
         help="Difference threshold for temporal confidence (0~1 scale).",
+    )
+    parser.add_argument(
+        "--temporal-occlusion-strength",
+        type=float,
+        default=0.55,
+        help="Occlusion gate strength for temporal blending (0~1).",
+    )
+    parser.add_argument(
+        "--temporal-occlusion-threshold",
+        type=float,
+        default=0.06,
+        help="Occlusion gate threshold (0~1).",
     )
     parser.add_argument(
         "--output-xml",
