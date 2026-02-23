@@ -48,6 +48,107 @@ def resolve_temporal_preset(name: str) -> Dict[str, float]:
     return {}
 
 
+def resolve_sr_preset(name: str) -> Dict[str, float]:
+    n = (name or "custom").strip().lower()
+    table: Dict[str, Dict[str, float]] = {
+        # Conservative quality boost with moderate AA.
+        "quality_plus": {
+            "sharpen_gain": 0.72,
+            "preserve_gain": 0.93,
+            "hybrid_flat_threshold": 0.019,
+            "hybrid_edge_threshold": 0.080,
+            "fed_step": 0.12,
+            "fed_kappa": 0.085,
+            "halo_guard_strength": 0.76,
+            "halo_risk_scale": 0.052,
+            "halo_edge_threshold": 0.072,
+            "halo_min_gain_ratio": 0.28,
+            "temporal_hf_gain": 1.10,
+            "temporal_detail_boost": 0.16,
+            "temporal_detail_threshold": 0.042,
+            "aa_strength": 0.24,
+            "aa_edge_threshold": 0.055,
+            "aa_hf_softness": 0.080,
+            "aa_passes": 1.0,
+            "detail_preserve_gain": 0.11,
+            "detail_preserve_threshold": 0.050,
+            "detail_preserve_cap": 0.20,
+        },
+        # Stronger anti-aliasing and halo suppression for high-contrast content.
+        "quality_plus_aa": {
+            "sharpen_gain": 0.7175,
+            "preserve_gain": 0.92,
+            "hybrid_flat_threshold": 0.018,
+            "hybrid_edge_threshold": 0.078,
+            "fed_step": 0.11,
+            "fed_kappa": 0.082,
+            "halo_guard_strength": 0.80,
+            "halo_risk_scale": 0.048,
+            "halo_edge_threshold": 0.068,
+            "halo_min_gain_ratio": 0.26,
+            "temporal_hf_gain": 1.08,
+            "temporal_detail_boost": 0.14,
+            "temporal_detail_threshold": 0.040,
+            "aa_strength": 0.34,
+            "aa_edge_threshold": 0.050,
+            "aa_hf_softness": 0.070,
+            "aa_passes": 2.0,
+            "detail_preserve_gain": 0.14,
+            "detail_preserve_threshold": 0.046,
+            "detail_preserve_cap": 0.24,
+        },
+        # Anime/line-art: keep line clarity and local detail; apply lighter AA.
+        "quality_plus_aa_anime": {
+            "sharpen_gain": 0.742,
+            "preserve_gain": 0.945,
+            "hybrid_flat_threshold": 0.017,
+            "hybrid_edge_threshold": 0.073,
+            "fed_step": 0.105,
+            "fed_kappa": 0.078,
+            "halo_guard_strength": 0.84,
+            "halo_risk_scale": 0.044,
+            "halo_edge_threshold": 0.062,
+            "halo_min_gain_ratio": 0.25,
+            "temporal_hf_gain": 1.14,
+            "temporal_detail_boost": 0.19,
+            "temporal_detail_threshold": 0.036,
+            "aa_strength": 0.24,
+            "aa_edge_threshold": 0.046,
+            "aa_hf_softness": 0.078,
+            "aa_passes": 1.0,
+            "detail_preserve_gain": 0.20,
+            "detail_preserve_threshold": 0.038,
+            "detail_preserve_cap": 0.30,
+        },
+        # Photo/live-action: reduce ringing and keep texture natural with stronger AA.
+        "quality_plus_aa_photo": {
+            "sharpen_gain": 0.705,
+            "preserve_gain": 0.905,
+            "hybrid_flat_threshold": 0.019,
+            "hybrid_edge_threshold": 0.080,
+            "fed_step": 0.108,
+            "fed_kappa": 0.084,
+            "halo_guard_strength": 0.86,
+            "halo_risk_scale": 0.046,
+            "halo_edge_threshold": 0.066,
+            "halo_min_gain_ratio": 0.24,
+            "temporal_hf_gain": 1.06,
+            "temporal_detail_boost": 0.12,
+            "temporal_detail_threshold": 0.045,
+            "aa_strength": 0.42,
+            "aa_edge_threshold": 0.052,
+            "aa_hf_softness": 0.065,
+            "aa_passes": 2.0,
+            "detail_preserve_gain": 0.10,
+            "detail_preserve_threshold": 0.052,
+            "detail_preserve_cap": 0.18,
+        },
+    }
+    if n in table:
+        return dict(table[n])
+    return {}
+
+
 def parse_shape(text: str) -> Tuple[int, int, int, int]:
     parts = [p.strip() for p in str(text).split(",")]
     if len(parts) != 4:
@@ -282,6 +383,13 @@ def build_fixed_sr_model(
     halo_risk_scale: float = 0.06,
     halo_edge_threshold: float = 0.08,
     halo_min_gain_ratio: float = 0.30,
+    detail_preserve_gain: float = 0.0,
+    detail_preserve_threshold: float = 0.05,
+    detail_preserve_cap: float = 0.22,
+    aa_strength: float = 0.0,
+    aa_edge_threshold: float = 0.055,
+    aa_hf_softness: float = 0.08,
+    aa_passes: int = 1,
 ) -> ov.Model:
     ops = ov.opset10
     out_h = int(in_h * upscale)
@@ -493,6 +601,38 @@ def build_fixed_sr_model(
         ops.constant(np.float32(sh_floor)),
         ops.multiply(ops.constant(np.float32(sh_span)), gain_gate),
     )
+
+    # Detail-preserve boost: keep extra HF only where local detail confidence is high.
+    dp_gain = max(0.0, float(detail_preserve_gain))
+    dp_th = max(0.0, min(0.99, float(detail_preserve_threshold)))
+    dp_cap = max(0.0, float(detail_preserve_cap))
+    if dp_gain > 1e-6:
+        dp_inv_span = 1.0 / max(1e-6, 1.0 - dp_th)
+        detail_conf = ops.clamp(
+            ops.multiply(
+                ops.subtract(high_mag_curr, ops.constant(np.float32(dp_th))),
+                ops.constant(np.float32(dp_inv_span)),
+            ),
+            0.0,
+            1.0,
+        )
+        # Reuse halo-risk map to avoid over-boosting unstable edge pixels.
+        detail_safe = ops.clamp(
+            ops.subtract(
+                one,
+                ops.multiply(halo_risk01, ops.constant(np.float32(0.5))),
+            ),
+            0.0,
+            1.0,
+        )
+        detail_delta = ops.multiply(
+            ops.multiply(detail_conf, detail_safe),
+            ops.constant(np.float32(dp_gain)),
+        )
+        if dp_cap > 1e-6:
+            detail_delta = ops.minimum(detail_delta, ops.constant(np.float32(dp_cap)))
+        sharpen_gain_map = ops.add(sharpen_gain_map, detail_delta)
+
     sharpened = ops.add(up_curr, ops.multiply(high_curr, sharpen_gain_map))
 
     y_pre = sharpened
@@ -605,6 +745,41 @@ def build_fixed_sr_model(
         y_pre = ops.add(low_blend, hf_term)
         y_pre = ops.clamp(y_pre, 0.0, 1.0)
 
+    # Edge-aware anti-alias: suppress staircase HF on strong edges while preserving micro-detail.
+    aa_s = max(0.0, min(1.0, float(aa_strength)))
+    aa_edge_th = max(0.0, min(0.99, float(aa_edge_threshold)))
+    aa_soft = max(1e-4, float(aa_hf_softness))
+    aa_n = max(1, min(3, int(aa_passes)))
+    if aa_s > 1e-6:
+        aa_low = y_pre
+        for _ in range(aa_n):
+            aa_low = _blur(aa_low)
+        aa_high = ops.subtract(y_pre, aa_low)
+        aa_high_mag = _mean_abs(aa_high)
+        aa_edge_conf = ops.clamp(
+            ops.multiply(
+                ops.subtract(aa_high_mag, ops.constant(np.float32(aa_edge_th))),
+                ops.constant(np.float32(1.0 / max(1e-6, 1.0 - aa_edge_th))),
+            ),
+            0.0,
+            1.0,
+        )
+        aa_denom = ops.add(
+            one,
+            ops.multiply(
+                ops.abs(aa_high),
+                ops.constant(np.float32(1.0 / aa_soft)),
+            ),
+        )
+        aa_high_comp = ops.divide(aa_high, aa_denom)
+        aa_candidate = ops.add(aa_low, aa_high_comp)
+        aa_w = ops.multiply(aa_edge_conf, ops.constant(np.float32(aa_s)))
+        y_pre = ops.add(
+            ops.multiply(y_pre, ops.subtract(one, aa_w)),
+            ops.multiply(aa_candidate, aa_w),
+        )
+        y_pre = ops.clamp(y_pre, 0.0, 1.0)
+
     blur1 = _blur(y_pre)
 
     # Blend sharpened and smoothed output: preserve_gain=1 keeps detail, 0 keeps smooth.
@@ -691,6 +866,14 @@ def run(args) -> int:
         halo_risk_scale = 0.0
         halo_edge_threshold = 0.0
         halo_min_gain_ratio = 0.0
+        detail_preserve_gain = 0.0
+        detail_preserve_threshold = 0.0
+        detail_preserve_cap = 0.0
+        aa_strength = 0.0
+        aa_edge_threshold = 0.0
+        aa_hf_softness = 0.0
+        aa_passes = 0
+        sr_preset = "custom"
     else:
         upscale = max(1, int(args.upscale))
         sharpen_gain = float(args.sharpen_gain)
@@ -714,7 +897,43 @@ def run(args) -> int:
         halo_edge_threshold = max(0.0, min(0.99, float(args.halo_edge_threshold))
         )
         halo_min_gain_ratio = max(0.0, min(1.0, float(args.halo_min_gain_ratio)))
+        detail_preserve_gain = max(0.0, float(args.detail_preserve_gain))
+        detail_preserve_threshold = max(0.0, min(0.99, float(args.detail_preserve_threshold)))
+        detail_preserve_cap = max(0.0, float(args.detail_preserve_cap))
+        aa_strength = max(0.0, min(1.0, float(args.aa_strength)))
+        aa_edge_threshold = max(0.0, min(0.99, float(args.aa_edge_threshold)))
+        aa_hf_softness = max(1e-4, float(args.aa_hf_softness))
+        aa_passes = max(1, min(3, int(args.aa_passes)))
+        sr_preset = str(args.sr_preset).strip().lower()
         temporal_preset = str(args.temporal_preset).strip().lower()
+        if sr_preset != "custom":
+            sr_vals = resolve_sr_preset(sr_preset)
+            if not sr_vals:
+                raise RuntimeError(
+                    f"Unknown --sr-preset: {args.sr_preset} "
+                    f"(expected one of: custom, quality_plus, quality_plus_aa, "
+                    f"quality_plus_aa_anime, quality_plus_aa_photo)"
+                )
+            sharpen_gain = float(sr_vals["sharpen_gain"])
+            preserve_gain = float(sr_vals["preserve_gain"])
+            hybrid_flat_threshold = float(sr_vals["hybrid_flat_threshold"])
+            hybrid_edge_threshold = float(sr_vals["hybrid_edge_threshold"])
+            fed_step = float(sr_vals["fed_step"])
+            fed_kappa = float(sr_vals["fed_kappa"])
+            halo_guard_strength = float(sr_vals["halo_guard_strength"])
+            halo_risk_scale = float(sr_vals["halo_risk_scale"])
+            halo_edge_threshold = float(sr_vals["halo_edge_threshold"])
+            halo_min_gain_ratio = float(sr_vals["halo_min_gain_ratio"])
+            temporal_hf_gain = float(sr_vals["temporal_hf_gain"])
+            temporal_detail_boost = float(sr_vals["temporal_detail_boost"])
+            temporal_detail_threshold = float(sr_vals["temporal_detail_threshold"])
+            aa_strength = float(sr_vals["aa_strength"])
+            aa_edge_threshold = float(sr_vals["aa_edge_threshold"])
+            aa_hf_softness = float(sr_vals["aa_hf_softness"])
+            aa_passes = int(sr_vals["aa_passes"])
+            detail_preserve_gain = float(sr_vals["detail_preserve_gain"])
+            detail_preserve_threshold = float(sr_vals["detail_preserve_threshold"])
+            detail_preserve_cap = float(sr_vals["detail_preserve_cap"])
         if temporal_model and temporal_preset != "custom":
             preset_vals = resolve_temporal_preset(temporal_preset)
             if not preset_vals:
@@ -755,6 +974,13 @@ def run(args) -> int:
             halo_risk_scale=halo_risk_scale,
             halo_edge_threshold=halo_edge_threshold,
             halo_min_gain_ratio=halo_min_gain_ratio,
+            detail_preserve_gain=detail_preserve_gain,
+            detail_preserve_threshold=detail_preserve_threshold,
+            detail_preserve_cap=detail_preserve_cap,
+            aa_strength=aa_strength,
+            aa_edge_threshold=aa_edge_threshold,
+            aa_hf_softness=aa_hf_softness,
+            aa_passes=aa_passes,
         )
 
     out_xml = Path(args.output_xml)
@@ -782,6 +1008,10 @@ def run(args) -> int:
             algo += "+temporal_v2(lowfreq_accum+hf_preserve+occlusion_gate)"
             if temporal_detail_boost > 1e-6:
                 algo += "+edge_aware_hf_gain"
+        if aa_strength > 1e-6:
+            algo += "+edge_aa(hf_compress)"
+        if detail_preserve_gain > 1e-6:
+            algo += "+detail_map_boost"
     print(f"algo={algo}")
     if model_type == "fg_mid":
         print(
@@ -789,6 +1019,7 @@ def run(args) -> int:
             f"fg_motion_high={fg_motion_high:.3f}, fg_motion_smooth={fg_motion_smooth:.3f}"
         )
     else:
+        print(f"sr_preset={sr_preset}")
         print(f"sharpen_gain={sharpen_gain:.3f}, preserve_gain={preserve_gain:.3f}")
         print(
             f"hybrid_flat_threshold={hybrid_flat_threshold:.4f}, "
@@ -798,6 +1029,15 @@ def run(args) -> int:
         print(
             f"halo_guard_strength={halo_guard_strength:.3f}, halo_risk_scale={halo_risk_scale:.4f}, "
             f"halo_edge_threshold={halo_edge_threshold:.4f}, halo_min_gain_ratio={halo_min_gain_ratio:.3f}"
+        )
+        print(
+            f"detail_preserve_gain={detail_preserve_gain:.3f}, "
+            f"detail_preserve_threshold={detail_preserve_threshold:.4f}, "
+            f"detail_preserve_cap={detail_preserve_cap:.3f}"
+        )
+        print(
+            f"aa_strength={aa_strength:.3f}, aa_edge_threshold={aa_edge_threshold:.4f}, "
+            f"aa_hf_softness={aa_hf_softness:.4f}, aa_passes={aa_passes}"
         )
     if model_type == "sr_x2" and temporal_model:
         print(f"temporal_preset={temporal_preset}")
@@ -893,6 +1133,18 @@ def main() -> int:
     )
     parser.add_argument("--input-shape", default="1,3,256,256", help="Static NCHW shape for model input.")
     parser.add_argument("--upscale", type=int, default=2, help="Upscale factor.")
+    parser.add_argument(
+        "--sr-preset",
+        choices=[
+            "custom",
+            "quality_plus",
+            "quality_plus_aa",
+            "quality_plus_aa_anime",
+            "quality_plus_aa_photo",
+        ],
+        default="custom",
+        help="SR quality preset. custom keeps manual --sharpen/--hybrid/--detail/--aa values.",
+    )
     parser.add_argument("--sharpen-gain", type=float, default=0.67, help="Unsharp detail gain.")
     parser.add_argument("--preserve-gain", type=float, default=0.90, help="Blend ratio between sharpened/smoothed.")
     parser.add_argument(
@@ -942,6 +1194,48 @@ def main() -> int:
         type=float,
         default=0.30,
         help="Minimum sharpen gain ratio under halo guard.",
+    )
+    parser.add_argument(
+        "--detail-preserve-gain",
+        type=float,
+        default=0.0,
+        help="Extra HF gain on high-detail regions (detail-map driven).",
+    )
+    parser.add_argument(
+        "--detail-preserve-threshold",
+        type=float,
+        default=0.05,
+        help="Detail confidence threshold for detail-preserve boost.",
+    )
+    parser.add_argument(
+        "--detail-preserve-cap",
+        type=float,
+        default=0.22,
+        help="Upper bound of detail-preserve additional gain.",
+    )
+    parser.add_argument(
+        "--aa-strength",
+        type=float,
+        default=0.0,
+        help="Edge-aware anti-aliasing strength (0~1).",
+    )
+    parser.add_argument(
+        "--aa-edge-threshold",
+        type=float,
+        default=0.055,
+        help="HF magnitude threshold for AA edge confidence.",
+    )
+    parser.add_argument(
+        "--aa-hf-softness",
+        type=float,
+        default=0.08,
+        help="HF compression softness for AA (higher keeps more detail).",
+    )
+    parser.add_argument(
+        "--aa-passes",
+        type=int,
+        default=1,
+        help="AA pre-blur passes (1~3).",
     )
     parser.add_argument("--temporal-model", action="store_true", help="Build temporal-plus multi-input model.")
     parser.add_argument(
