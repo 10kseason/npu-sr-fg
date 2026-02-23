@@ -1,0 +1,7 @@
+# Runtime dependencies (GUI + scripts)
+numpy
+openvino
+onnxruntime-openvino
+opencv-python
+Pillow
+dxcam
